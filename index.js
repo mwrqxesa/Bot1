@@ -239,7 +239,7 @@ process.on('unhandledRejection', error => {
 // Auto-reconnect on disconnect
 client.on('disconnect', () => {
     console.log('Bot desconectado, tentando reconectar...');
-    client.login(process.env.BOT_TOKEN).catch(console.error);
+    client.login(process.env.DISCORD_TOKEN);
 });
 
 // Auto-reconnect function for the client
