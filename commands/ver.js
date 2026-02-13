@@ -11,7 +11,8 @@ module.exports = {
     .setName('ver')
     .setDescription('[Mush] Mostra principais dados da conta (ban/mute/tempo/infos).')
     .addStringOption(option =>
-      option.setName('nick')
+      option
+        .setName('nick')
         .setDescription('Nick do jogador')
         .setRequired(true)
     ),
@@ -44,7 +45,6 @@ module.exports = {
       });
 
       if (park.data?.success && park.data?.response) {
-        // Alguns retornos variam; pega o que existir
         parkourRecord = park.data.response?.record ?? park.data.response?.bedwars ?? 'Nenhum';
       }
     } catch {}
@@ -52,6 +52,15 @@ module.exports = {
     const acc = player.account || {};
     const uniqueId = acc.unique_id;
     const username = acc.username || nick;
+
+    // Link clicável da skin (texto azul "Clique aqui")
+    // Você pode trocar "full" por "face" se quiser só rosto:
+    // https://visage.surgeplay.com/face/512/${uniqueId}
+    const skinUrl = uniqueId ? `https://visage.surgeplay.com/full/512/${uniqueId}` : null;
+    const skinText = skinUrl ? `[Clique aqui](${skinUrl})` : 'N/A';
+
+    const clanText = player.clan ? `[${player.clan.tag}] ${player.clan.name}` : 'Nenhum';
+    const friendsText = player.friends ? `${player.friends.count}/${player.friends.limit}` : '0/0';
 
     const embed = new EmbedBuilder()
       .setTitle(`📌 Menu: ${username}`)
@@ -62,9 +71,9 @@ module.exports = {
         `\`•\` **Tag de Perfil**: ${player.profile_tag?.name || 'Nenhuma'}`,
         `\`•\` **Conta**: ${acc.type || 'N/A'}`,
         `\`•\` **Online**: ${player.connected ? 'Sim' : 'Não'}`,
-        `\`•\` **Clan**: ${player.clan ? `[${player.clan.tag}] ${player.clan.name}` : 'Nenhum'}`,
-        `\`•\` **Amigos**: ${player.friends ? `${player.friends.count}/${player.friends.limit}` : '0/0'}`,
-        `\`•\` **Skin**: ${uniqueId ? `https://visage.surgeplay.com/full/512/${uniqueId}` : 'N/A'}`,
+        `\`•\` **Clan**: ${clanText}`,
+        `\`•\` **Amigos**: ${friendsText}`,
+        `\`•\` **Skin**: ${skinText}`,
         ``,
         `\`•\` **Recorde do Parkour**: ${parkourRecord}`,
         `\`•\` **Primeiro login**: ${discordTs(player.first_login, 'R')}`,
@@ -75,13 +84,15 @@ module.exports = {
         `\`•\` **Bans para Blacklist (#)**: ${Number(player.ban_blacklist_count || 0)}/3`,
         `\`•\` **Contagem de Mutes (#)**: ${Number(player.mute_blacklist_count || 0)}`
       ].join('\n'))
-      .setFooter({ text: 'Desenvolvido por Lynn', iconURL: 'https://cdn.discordapp.com/avatars/826501596702965850/813268a3df7c76fe40f082f459f08da6.png?size=2048' })
+      .setFooter({
+        text: 'Desenvolvido por Lynn',
+        iconURL: 'https://cdn.discordapp.com/avatars/826501596702965850/813268a3df7c76fe40f082f459f08da6.png?size=2048'
+      })
       .setTimestamp();
 
+    // Sem "Entre no servidor..." — apenas o embed
     return interaction.editReply({
-      content: '<:Mush:1324516271588376718> » Entre no [**Servidor de Suporte do BOT!**](https://discord.gg/gp97MzATnG)',
       embeds: [embed]
     });
   }
 };
-
