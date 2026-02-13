@@ -42,9 +42,10 @@ module.exports = {
             const embed = createEmbed(username, bedwarsStats, bedwarsStats, data.response.account.unique_id, playTime);
 
             await interaction.reply({
-                content: '<:Mush:1324516271588376718> » Entre no [**servidor de suporte do BOT!**](https://discord.gg/gp97MzATnG)', // Use o ID do emoji aqui
-                embeds: [embed],
-                components: [row],
+  embeds: [embed],
+  components: [buttons],
+});
+
             });
 
             const filter = i => i.customId === 'select-mode' && i.user.id === interaction.user.id;
@@ -128,7 +129,7 @@ module.exports = {
                 }
 
                 if (!stats) {
-                    await i.update({ content: 'Estatísticas não encontradas para o modo selecionado.', components: [] });
+await i.update({ embeds: [updatedEmbed], components: [updatedButtons] });
                     return;
                 }
 
@@ -151,44 +152,49 @@ module.exports = {
     },
 };
 
-function createEmbed(username, bedwarsStats, stats, uniqueId, playTime, mode = 'geral') {
-    const kdr = stats?.deaths ? (stats.kills / stats.deaths).toFixed(2) : 'N/A';
-    const wlr = stats?.losses ? (stats.wins / stats.losses).toFixed(2) : 'N/A';
-    const fkdr = stats?.final_deaths ? (stats.final_kills / stats.final_deaths).toFixed(2) : 'N/A';
-    const bblr = stats?.beds_lost ? (stats.beds_broken / stats.beds_lost).toFixed(2) : 'N/A';
+function createEmbed(username, bw, stats, uniqueId, playTimeSeconds) {
+  const kdr  = stats.deaths ? (stats.kills / stats.deaths).toFixed(2) : '0.00';
+  const wlr  = stats.losses ? (stats.wins / stats.losses).toFixed(2) : '0.00';
+  const fkdr = stats.final_deaths ? (stats.final_kills / stats.final_deaths).toFixed(2) : '0.00';
+  const bblr = stats.beds_lost ? (stats.beds_broken / stats.beds_lost).toFixed(2) : '0.00';
 
-    return new EmbedBuilder()
-        .setTitle(`<:Caminha:1324521740411605002>・Bed Wars (${mode.charAt(0).toUpperCase() + mode.slice(1)}): ${username}`) // Use o ID do emoji aqui
-        .setColor('#0099ff')
-        .setThumbnail(`https://visage.surgeplay.com/face/256/${uniqueId}`) // URL para obter a cabeça do jogador
-        .setDescription(`
-            \`•\` **Nível**: [${bedwarsStats.level || 'N/A'}✽]
-            \`•\` **XP**: ${bedwarsStats.xp?.toLocaleString() || 'N/A'} ➜ [${bedwarsStats.xp % 15000}/15.000]
+  const hours = (Number(playTimeSeconds || 0) / 3600).toFixed(2);
 
-            \`•\` **Camas quebradas**: ${stats?.beds_broken?.toLocaleString() || 'N/A'}
-            \`•\` **Camas perdidas**: ${stats?.beds_lost?.toLocaleString() || 'N/A'}
+  const desc = [
+    `• **Nível:** [${bw.level ?? 0}✽]`,
+    `• **XP:** ${(bw.xp ?? 0).toLocaleString('pt-BR')} → [${(bw.xp ?? 0) % 15000}/15000]`,
+    ``,
+    `• **Camas quebradas:** ${(stats.beds_broken ?? 0).toLocaleString('pt-BR')}`,
+    `• **Camas perdidas:** ${(stats.beds_lost ?? 0).toLocaleString('pt-BR')}`,
+    ``,
+    `• **Abates:** ${(stats.kills ?? 0).toLocaleString('pt-BR')}`,
+    `• **Mortes:** ${(stats.deaths ?? 0).toLocaleString('pt-BR')}`,
+    `• **Assistências:** ${(stats.assists ?? 0).toLocaleString('pt-BR')}`,
+    ``,
+    `• **Abates finais:** ${(stats.final_kills ?? 0).toLocaleString('pt-BR')}`,
+    `• **Mortes finais:** ${(stats.final_deaths ?? 0).toLocaleString('pt-BR')}`,
+    `• **Assistências finais:** ${(stats.final_assists ?? 0).toLocaleString('pt-BR')}`,
+    ``,
+    `• **Vitórias:** ${(stats.wins ?? 0).toLocaleString('pt-BR')}`,
+    `• **Derrotas:** ${(stats.losses ?? 0).toLocaleString('pt-BR')}`,
+    `• **Partidas jogadas:** ${(stats.games_played ?? 0).toLocaleString('pt-BR')}`,
+    `• **Tempo online:** ${hours} horas`,
+    ``,
+    `• **Winstreak:** ${(stats.winstreak ?? 0).toLocaleString('pt-BR')}`,
+    `• **Maior Winstreak:** ${(stats.max_winstreak ?? 0).toLocaleString('pt-BR')}`,
+    ``,
+    `• **KDR:** ${kdr}`,
+    `• **WLR:** ${wlr}`,
+    `• **FKDR:** ${fkdr}`,
+    `• **BBLR:** ${bblr}`,
+  ].join('\n');
 
-            \`•\` **Abates**: ${stats?.kills?.toLocaleString() || 'N/A'}
-            \`•\` **Mortes**: ${stats?.deaths?.toLocaleString() || 'N/A'}
-            \`•\` **Assistências**: ${stats?.assists?.toLocaleString() || 'N/A'}
-
-            \`•\` **Abates finais**: ${stats?.final_kills?.toLocaleString() || 'N/A'}
-            \`•\` **Mortes finais**: ${stats?.final_deaths?.toLocaleString() || 'N/A'}
-            \`•\` **Assistências finais**: ${stats?.final_assists?.toLocaleString() || 'N/A'}
-
-            \`•\` **Vitórias**: ${stats?.wins?.toLocaleString() || 'N/A'} (${((stats?.wins / stats?.games_played) * 100).toFixed(2) || 'N/A'}%)
-            \`•\` **Derrotas**: ${stats?.losses?.toLocaleString() || 'N/A'}
-            \`•\` **Partidas jogadas**: ${stats?.games_played?.toLocaleString() || 'N/A'}
-            \`•\` **Tempo online**: ${(playTime / 3600).toFixed(2)} horas
-
-            \`•\` **Winstreak**: ${stats?.winstreak?.toLocaleString() || 'N/A'}
-            \`•\` **Maior Winstreak**: ${stats?.max_winstreak?.toLocaleString() || 'N/A'}
-
-            \`•\` **KDR**: ${kdr}
-            \`•\` **WLR**: ${wlr}
-            \`•\` **FKDR**: ${fkdr}
-            \`•\` **BBLR**: ${bblr}
-        `)
-        .setFooter({ text: 'Desenvolvido por Rezando', iconURL: 'https://cdn.discordapp.com/avatars/1283948475742031912/fb0b536e1dad49337d09d5d67504a8b2.png' }) // Substitua pela URL do logo do MushMC, se disponível
+  return new EmbedBuilder()
+    .setTitle(`<:Caminha:1324521740411605002> • Bed Wars (Geral): ${username}`)
+    .setColor('#2b2d31')
+    .setThumbnail(`https://visage.surgeplay.com/face/256/${uniqueId}`)
+    .setDescription(desc)
+    .setFooter({ text: `Desenvolvido por Rezando | Hoje às ${new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}` });
+}
         .setTimestamp();
 }
