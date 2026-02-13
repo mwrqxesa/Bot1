@@ -75,7 +75,7 @@ module.exports = {
         `\`•\` **Bans para Blacklist (#)**: ${Number(player.ban_blacklist_count || 0)}/3`,
         `\`•\` **Contagem de Mutes (#)**: ${Number(player.mute_blacklist_count || 0)}`
       ].join('\n'))
-      .setFooter({ text: 'Desenvolvido por yPandinho', iconURL: 'https://cdn.discordapp.com/avatars/1283948475742031912/fb0b536e1dad49337d09d5d67504a8b2.png' })
+      .setFooter({ text: 'Desenvolvido por Lynn', iconURL: 'https://cdn.discordapp.com/avatars/826501596702965850/813268a3df7c76fe40f082f459f08da6.png?size=2048' })
       .setTimestamp();
 
     return interaction.editReply({
@@ -84,3 +84,4 @@ module.exports = {
     });
   }
 };
+
