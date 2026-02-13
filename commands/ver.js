@@ -73,7 +73,7 @@ module.exports = {
         `\`•\` **Online**: ${player.connected ? 'Sim' : 'Não'}`,
         `\`•\` **Clan**: ${clanText}`,
         `\`•\` **Amigos**: ${friendsText}`,
-        `\`•\` **Skin**: ${skinText}`,
+        `\`•\` **Skin**: ${uniqueId ? `[Clique aqui](https://visage.surgeplay.com/face/512/${uniqueId})` : 'N/A'}`
         ``,
         `\`•\` **Recorde do Parkour**: ${parkourRecord}`,
         `\`•\` **Primeiro login**: ${discordTs(player.first_login, 'R')}`,
@@ -96,3 +96,4 @@ module.exports = {
     });
   }
 };
+
