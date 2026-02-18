@@ -44,7 +44,7 @@ function clipCircle(ctx, x, y, r) {
 
 module.exports = {
   data: new SlashCommandBuilder()
-    .setName('amor')
+    .setName('Zangwdos')
     .setDescription('Cria uma imagem amorosa de dois perfis com coração 💘')
     .addUserOption(opt =>
       opt.setName('pessoa1')
