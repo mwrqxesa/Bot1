@@ -2,11 +2,10 @@ const { SlashCommandBuilder, AttachmentBuilder } = require('discord.js');
 const { createCanvas, loadImage } = require('canvas');
 
 function hashToPercent(a, b) {
-  // Determinístico: mesma dupla = mesmo %
   const s = `${a}:${b}`;
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return (h % 101); // 0..100
+  return (h % 101);
 }
 
 function drawHeart(ctx, x, y, size) {
@@ -22,7 +21,6 @@ function drawHeart(ctx, x, y, size) {
   ctx.bezierCurveTo(0.5, 0.05, 0, 0.05, 0, 0.35);
   ctx.closePath();
 
-  // brilho
   const grad = ctx.createLinearGradient(-0.5, 0, 0.5, 1);
   grad.addColorStop(0, '#ff4d6d');
   grad.addColorStop(1, '#ff99ac');
@@ -31,7 +29,6 @@ function drawHeart(ctx, x, y, size) {
   ctx.shadowColor = 'rgba(255, 0, 85, 0.55)';
   ctx.shadowBlur = 18;
   ctx.fill();
-
   ctx.restore();
 }
 
@@ -44,17 +41,13 @@ function clipCircle(ctx, x, y, r) {
 
 module.exports = {
   data: new SlashCommandBuilder()
-    .setName('Zangwdos')
+    .setName('zangwdos') // ✅ TEM QUE SER MINÚSCULO
     .setDescription('Cria uma imagem amorosa de dois perfis com coração 💘')
     .addUserOption(opt =>
-      opt.setName('pessoa1')
-        .setDescription('Primeira pessoa')
-        .setRequired(true)
+      opt.setName('pessoa1').setDescription('Primeira pessoa').setRequired(true)
     )
     .addUserOption(opt =>
-      opt.setName('pessoa2')
-        .setDescription('Segunda pessoa')
-        .setRequired(true)
+      opt.setName('pessoa2').setDescription('Segunda pessoa').setRequired(true)
     ),
 
   async execute(interaction) {
@@ -64,19 +57,16 @@ module.exports = {
     const u2 = interaction.options.getUser('pessoa2', true);
 
     try {
-      const W = 900;
-      const H = 420;
+      const W = 900, H = 420;
       const canvas = createCanvas(W, H);
       const ctx = canvas.getContext('2d');
 
-      // Fundo (degradê)
       const bg = ctx.createLinearGradient(0, 0, W, H);
       bg.addColorStop(0, '#1b0b12');
       bg.addColorStop(1, '#2a0d1a');
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, W, H);
 
-      // Coraçõezinhos no fundo
       ctx.globalAlpha = 0.12;
       for (let i = 0; i < 30; i++) {
         const x = Math.random() * W;
@@ -86,21 +76,24 @@ module.exports = {
       }
       ctx.globalAlpha = 1;
 
-      // “Card” central
       ctx.fillStyle = 'rgba(255,255,255,0.06)';
       ctx.strokeStyle = 'rgba(255,255,255,0.10)';
       ctx.lineWidth = 2;
 
+      // Se roundRect não existir, desenha um retângulo normal
       const cardX = 40, cardY = 40, cardW = W - 80, cardH = H - 80;
-      ctx.beginPath();
-      ctx.roundRect(cardX, cardY, cardW, cardH, 24);
-      ctx.fill();
-      ctx.stroke();
+      if (typeof ctx.roundRect === 'function') {
+        ctx.beginPath();
+        ctx.roundRect(cardX, cardY, cardW, cardH, 24);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        ctx.fillRect(cardX, cardY, cardW, cardH);
+        ctx.strokeRect(cardX, cardY, cardW, cardH);
+      }
 
-      // Avatares
       const a1 = u1.displayAvatarURL({ extension: 'png', size: 512 });
       const a2 = u2.displayAvatarURL({ extension: 'png', size: 512 });
-
       const [img1, img2] = await Promise.all([loadImage(a1), loadImage(a2)]);
 
       const r = 110;
@@ -108,7 +101,6 @@ module.exports = {
       const rightX = W * 0.72;
       const centerY = H * 0.52;
 
-      // borda glow
       function drawAvatar(img, x) {
         ctx.save();
         ctx.shadowColor = 'rgba(255, 102, 178, 0.55)';
@@ -134,15 +126,12 @@ module.exports = {
       drawAvatar(img1, leftX);
       drawAvatar(img2, rightX);
 
-      // Coração no meio
       drawHeart(ctx, W / 2, centerY - 10, 1.4);
 
-      // Texto (nomes + compatibilidade)
       const percent = hashToPercent(u1.id, u2.id);
 
       ctx.fillStyle = '#ffffff';
       ctx.textAlign = 'center';
-
       ctx.font = 'bold 34px sans-serif';
       ctx.fillText(`${u1.username}  💞  ${u2.username}`, W / 2, 110);
 
@@ -154,11 +143,10 @@ module.exports = {
       ctx.fillStyle = 'rgba(255,255,255,0.70)';
       ctx.fillText('feito com carinho ✨', W / 2, H - 70);
 
-      const attachment = new AttachmentBuilder(canvas.toBuffer('image/png'), { name: 'amor.png' });
-
+      const attachment = new AttachmentBuilder(canvas.toBuffer('image/png'), { name: 'zangwdos.png' });
       return interaction.editReply({ files: [attachment] });
     } catch (err) {
-      console.error('Erro no comando /amor:', err);
+      console.error('Erro no comando /zangwdos:', err);
       return interaction.editReply('❌ Não consegui gerar a imagem agora. Tente novamente.');
     }
   }
