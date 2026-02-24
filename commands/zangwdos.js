@@ -1,6 +1,10 @@
 const { SlashCommandBuilder, AttachmentBuilder } = require('discord.js');
 const { createCanvas, loadImage } = require('canvas');
 
+// IDs fixos
+const USER1_ID = '826501596702965850'; // Zangwda
+const USER2_ID = '701959666678366229'; // Zangwdo
+
 function hashToPercent(a, b) {
   const s = `${a}:${b}`;
   let h = 0;
@@ -41,32 +45,35 @@ function clipCircle(ctx, x, y, r) {
 
 module.exports = {
   data: new SlashCommandBuilder()
-    .setName('zangwdos') // ✅ TEM QUE SER MINÚSCULO
-    .setDescription('Cria uma imagem amorosa de dois perfis com coração 💘')
-    .addUserOption(opt =>
-      opt.setName('pessoa1').setDescription('Primeira pessoa').setRequired(true)
-    )
-    .addUserOption(opt =>
-      opt.setName('pessoa2').setDescription('Segunda pessoa').setRequired(true)
-    ),
+    .setName('zangwdos')
+    .setDescription('💘 Overlay amorosa (Zangwda + Zangwdo).'),
 
   async execute(interaction) {
     await interaction.deferReply();
 
-    const u1 = interaction.options.getUser('pessoa1', true);
-    const u2 = interaction.options.getUser('pessoa2', true);
+    // Busca os 2 usuários fixos
+    let u1, u2;
+    try {
+      u1 = await interaction.client.users.fetch(USER1_ID);
+      u2 = await interaction.client.users.fetch(USER2_ID);
+    } catch (err) {
+      console.error('Erro ao buscar usuários fixos:', err);
+      return interaction.editReply('❌ Não consegui encontrar os usuários configurados.');
+    }
 
     try {
       const W = 900, H = 420;
       const canvas = createCanvas(W, H);
       const ctx = canvas.getContext('2d');
 
+      // Fundo (degradê)
       const bg = ctx.createLinearGradient(0, 0, W, H);
       bg.addColorStop(0, '#1b0b12');
       bg.addColorStop(1, '#2a0d1a');
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, W, H);
 
+      // Corações no fundo
       ctx.globalAlpha = 0.12;
       for (let i = 0; i < 30; i++) {
         const x = Math.random() * W;
@@ -76,11 +83,11 @@ module.exports = {
       }
       ctx.globalAlpha = 1;
 
+      // Card central
       ctx.fillStyle = 'rgba(255,255,255,0.06)';
       ctx.strokeStyle = 'rgba(255,255,255,0.10)';
       ctx.lineWidth = 2;
 
-      // Se roundRect não existir, desenha um retângulo normal
       const cardX = 40, cardY = 40, cardW = W - 80, cardH = H - 80;
       if (typeof ctx.roundRect === 'function') {
         ctx.beginPath();
@@ -92,6 +99,7 @@ module.exports = {
         ctx.strokeRect(cardX, cardY, cardW, cardH);
       }
 
+      // Avatares
       const a1 = u1.displayAvatarURL({ extension: 'png', size: 512 });
       const a2 = u2.displayAvatarURL({ extension: 'png', size: 512 });
       const [img1, img2] = await Promise.all([loadImage(a1), loadImage(a2)]);
@@ -126,10 +134,11 @@ module.exports = {
       drawAvatar(img1, leftX);
       drawAvatar(img2, rightX);
 
+      // Coração no meio
       drawHeart(ctx, W / 2, centerY - 10, 1.4);
 
+      // Texto
       const percent = hashToPercent(u1.id, u2.id);
-
       ctx.fillStyle = '#ffffff';
       ctx.textAlign = 'center';
       ctx.font = 'bold 34px sans-serif';
@@ -144,7 +153,11 @@ module.exports = {
       ctx.fillText('feito com carinho ✨', W / 2, H - 70);
 
       const attachment = new AttachmentBuilder(canvas.toBuffer('image/png'), { name: 'zangwdos.png' });
-      return interaction.editReply({ files: [attachment] });
+
+      return interaction.editReply({
+        content: `💘 ${u1} x ${u2}`,
+        files: [attachment],
+      });
     } catch (err) {
       console.error('Erro no comando /zangwdos:', err);
       return interaction.editReply('❌ Não consegui gerar a imagem agora. Tente novamente.');
