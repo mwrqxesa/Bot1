@@ -150,7 +150,7 @@ module.exports = {
 
       ctx.font = '16px sans-serif';
       ctx.fillStyle = 'rgba(255,255,255,0.70)';
-      ctx.fillText('feito com carinho ✨', W / 2, H - 70);
+      ctx.fillText('By: Lhx', W / 2, H - 70);
 
       const attachment = new AttachmentBuilder(canvas.toBuffer('image/png'), { name: 'zangwdos.png' });
 
