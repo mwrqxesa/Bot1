@@ -11,18 +11,19 @@ const LicenseManager = require('./handlers/LicenseManager');
 const ClanManager = require('./handlers/ClanManager');
 const PlayerManager = require('./utils/PlayerManager');
 const GuildSettingsManager = require('./managers/GuildSettingsManager');
+const CallRankingManager = require('./managers/CallRankingManager');
 
 // =====================
-// 1) TOKEN (1 só)
+// TOKEN (aceita BOT_TOKEN ou DISCORD_TOKEN)
 // =====================
 const TOKEN = process.env.BOT_TOKEN || process.env.DISCORD_TOKEN;
 if (!TOKEN) {
-  console.error('❌ ERRO: Nenhum token encontrado. Crie BOT_TOKEN (recomendado) ou DISCORD_TOKEN nas variáveis de ambiente.');
+  console.error('❌ Nenhum token encontrado. Configure BOT_TOKEN (ou DISCORD_TOKEN) no ambiente.');
   process.exit(1);
 }
 
 // =====================
-// 2) CLIENT
+// CLIENT
 // =====================
 const client = new Client({
   intents: [
@@ -30,6 +31,7 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates, // ✅ necessário para ranking de call
   ],
   shards: 'auto',
   failIfNotExists: false,
@@ -41,22 +43,23 @@ const client = new Client({
 
 client.commands = new Collection();
 
-// Managers / Sistemas
+// Managers / sistemas
 client.licenses = new LicenseManager();
-client.players = new PlayerManager();
 client.clans = new ClanManager(client);
+client.players = new PlayerManager();
 client.guildSettingsManager = new GuildSettingsManager(client);
 client.recruitmentManager = new RecruitmentManager(client);
+client.callRanking = new CallRankingManager(client);
 
 // =====================
-// 3) CARREGAR COMANDOS
+// CARREGAR COMANDOS
 // =====================
 const commandsPath = path.join(__dirname, 'commands');
 const commandFiles = fs.existsSync(commandsPath)
-  ? fs.readdirSync(commandsPath).filter(f => f.endsWith('.js'))
+  ? fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'))
   : [];
 
-const commandsForAPI = [];
+const commands = [];
 
 for (const file of commandFiles) {
   const filePath = path.join(commandsPath, file);
@@ -65,59 +68,58 @@ for (const file of commandFiles) {
   try {
     command = require(filePath);
   } catch (err) {
-    console.warn(`[AVISO] Falha ao carregar ${file}:`, err?.message || err);
+    console.warn(`[AVISO] Falha ao carregar comando ${file}:`, err?.message || err);
     continue;
   }
 
-  // Precisa ter data e execute
-  if (!command?.data || typeof command.execute !== 'function') {
-    console.warn(`[AVISO] O comando ${file} está faltando 'data' e/ou 'execute'.`);
-    continue;
-  }
-
-  // Se for comando em objeto simples (compatibilidade)
-  if (typeof command.data === 'object' && typeof command.data.toJSON !== 'function') {
-    const { name, description, options = [] } = command.data;
-
-    if (!name || !description) {
-      console.warn(`[AVISO] O comando ${file} tem data inválida (sem name/description).`);
-      continue;
+  if ('data' in command && 'execute' in command) {
+    // Compatibilidade com objetos simples (sem SlashCommandBuilder)
+    if (typeof command.data === 'object' && typeof command.data.toJSON !== 'function') {
+      const { name, description, options = [] } = command.data;
+      command.data = {
+        name,
+        description,
+        options,
+        toJSON() {
+          return {
+            name: this.name,
+            description: this.description,
+            options: this.options,
+          };
+        },
+      };
     }
 
-    command.data = {
-      name,
-      description,
-      options,
-      toJSON() {
-        return { name: this.name, description: this.description, options: this.options };
-      }
-    };
-  }
-
-  client.commands.set(command.data.name, command);
-
-  // Para registrar no Discord
-  try {
-    commandsForAPI.push(command.data.toJSON());
-  } catch (e) {
-    console.warn(`[AVISO] Não foi possível converter data.toJSON() do comando ${file}.`);
+    try {
+      client.commands.set(command.data.name, command);
+      commands.push(command.data.toJSON());
+    } catch (err) {
+      console.warn(`[AVISO] Não foi possível registrar slash data do comando ${file}:`, err?.message || err);
+    }
+  } else {
+    console.warn(`[AVISO] O comando em ${filePath} está faltando 'data' ou 'execute'.`);
   }
 }
 
 console.log(`✅ Comandos carregados: ${client.commands.size}`);
 
 // =====================
-// 4) CARREGAR EVENTS
+// REGISTRO DE COMANDOS SLASH
+// =====================
+const rest = new REST({ version: '9' }).setToken(TOKEN);
+
+// =====================
+// LOAD EVENTS
 // =====================
 const eventsPath = path.join(__dirname, 'events');
 const eventFiles = fs.existsSync(eventsPath)
-  ? fs.readdirSync(eventsPath).filter(f => f.endsWith('.js'))
+  ? fs.readdirSync(eventsPath).filter(file => file.endsWith('.js'))
   : [];
 
 for (const file of eventFiles) {
   const filePath = path.join(eventsPath, file);
-  let event;
 
+  let event;
   try {
     event = require(filePath);
   } catch (err) {
@@ -126,46 +128,52 @@ for (const file of eventFiles) {
   }
 
   if (!event?.name || typeof event.execute !== 'function') {
-    console.warn(`[AVISO] Evento inválido em ${file} (sem name/execute).`);
+    console.warn(`[AVISO] Evento inválido em ${filePath} (sem name/execute).`);
     continue;
   }
 
-  if (event.once) client.once(event.name, (...args) => event.execute(...args));
-  else client.on(event.name, (...args) => event.execute(...args));
+  if (event.once) {
+    client.once(event.name, (...args) => event.execute(...args));
+  } else {
+    client.on(event.name, (...args) => event.execute(...args));
+  }
 }
 
 console.log(`✅ Events carregados: ${eventFiles.length}`);
 
 // =====================
-// 5) REGISTRAR SLASH COMMANDS NO READY
+// READY
 // =====================
-const rest = new REST({ version: '9' }).setToken(TOKEN);
-
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot iniciado como ${client.user.tag}`);
 
-  // Registra slash commands globalmente
+  // Registra comandos globalmente
   try {
     await rest.put(
       Routes.applicationCommands(client.user.id),
-      { body: commandsForAPI }
+      { body: commands },
     );
     console.log('✅ Comandos slash registrados com sucesso!');
   } catch (error) {
     console.error('❌ Erro ao registrar comandos slash:', error);
   }
 
-  // Inicializa seus sistemas
-  try {
-    client.ownerId = '1283948475742031912';
+  client.ownerId = '1283948475742031912';
 
+  // Inicializa sistemas
+  try {
     await client.licenses.init();
     console.log('✅ Sistema de licenças inicializado');
 
     await client.players.init();
     await client.clans.init();
 
+    // recria manager se seu projeto depende desse comportamento
     client.recruitmentManager = new RecruitmentManager(client);
+
+    // Ranking de call
+    await client.callRanking.init();
+    console.log('✅ Ranking de call inicializado');
 
     console.log('✅ Todos os sistemas inicializados com sucesso');
   } catch (error) {
@@ -174,11 +182,11 @@ client.once(Events.ClientReady, async () => {
 });
 
 // =====================
-// 6) INTERACTIONS (comandos/botões/modais)
+// INTERAÇÕES
 // =====================
 client.on('interactionCreate', async (interaction) => {
   try {
-    // Slash Commands
+    // Slash commands
     if (interaction.isCommand()) {
       const command = client.commands.get(interaction.commandName);
       if (!command) return;
@@ -186,22 +194,23 @@ client.on('interactionCreate', async (interaction) => {
       try {
         await command.execute(interaction);
       } catch (error) {
-        console.error('Command execution error:', error);
+        console.error(`Command execution error [/${interaction.commandName}]:`, error);
 
-        const payload = {
+        const errorPayload = {
           embeds: [{
             description: '❌ **Ocorreu um erro ao executar este comando!**',
-            color: 0xff0000
+            color: 0xff0000,
           }],
-          ephemeral: true
+          ephemeral: true,
         };
 
         if (!interaction.replied && !interaction.deferred) {
-          await interaction.reply(payload);
+          await interaction.reply(errorPayload);
         } else {
-          await interaction.editReply(payload);
+          await interaction.editReply(errorPayload).catch(() => {});
         }
       }
+
       return;
     }
 
@@ -209,15 +218,19 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton()) {
       const id = interaction.customId;
 
+      // Botões de recrutamento / tickets
       if (['apply_recruitment', 'apply_aranked', 'close_ticket'].includes(id)) {
-        return client.recruitmentManager.handleButton(interaction);
+        await client.recruitmentManager.handleButton(interaction);
+        return;
       }
 
+      // Botões do sistema CxC
       if (['cxc', 'parceria', 'accept_cxc', 'decline_cxc'].includes(id)) {
         const adminCxcCommand = client.commands.get('admincxc');
         if (adminCxcCommand?.handleButton) {
-          return adminCxcCommand.handleButton(interaction);
+          await adminCxcCommand.handleButton(interaction);
         }
+        return;
       }
 
       return;
@@ -225,36 +238,43 @@ client.on('interactionCreate', async (interaction) => {
 
     // Modais
     if (interaction.isModalSubmit()) {
+      // Modal de edição de painel
       if (interaction.customId.startsWith('paineledit_')) {
         const parts = interaction.customId.split('_');
         const channelId = parts[2];
 
         const channel = await interaction.guild?.channels.fetch(channelId).catch(() => null);
-        if (!channel) {
-          return interaction.reply({
+
+        if (channel) {
+          interaction.channel = channel; // mantém sua lógica
+          await client.recruitmentManager.handlePanelEditModal(interaction);
+        } else {
+          await interaction.reply({
             content: '❌ Canal não encontrado. O painel pode ter sido movido ou deletado.',
-            ephemeral: true
+            ephemeral: true,
           });
         }
-
-        interaction.channel = channel;
-        return client.recruitmentManager.handlePanelEditModal(interaction);
+        return;
       }
 
       if (interaction.customId === 'recruitment_modal') {
-        return client.recruitmentManager.handleRecruitmentModal(interaction);
+        await client.recruitmentManager.handleRecruitmentModal(interaction);
+        return;
       }
 
       if (interaction.customId === 'aranked_modal') {
-        return client.recruitmentManager.handleArankedModal(interaction);
+        await client.recruitmentManager.handleArankedModal(interaction);
+        return;
       }
 
       if (interaction.customId === 'cxc-modal') {
-        return client.recruitmentManager.handleCxCModal(interaction);
+        await client.recruitmentManager.handleCxCModal(interaction);
+        return;
       }
 
       if (interaction.customId === 'parceria-modal') {
-        return client.recruitmentManager.handleParceriaModal(interaction);
+        await client.recruitmentManager.handleParceriaModal(interaction);
+        return;
       }
     }
   } catch (error) {
@@ -263,20 +283,37 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // =====================
-// 7) ERROS (logs)
+// RANKING DE CALL (voice state)
 // =====================
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason);
+client.on('voiceStateUpdate', (oldState, newState) => {
+  try {
+    client.callRanking?.onVoiceStateUpdate(oldState, newState);
+  } catch (err) {
+    console.error('Erro no voiceStateUpdate do ranking:', err);
+  }
 });
+
+// =====================
+// ERROS / LOGS
+// =====================
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
 });
+
 client.on('error', (error) => {
   console.error('Client Error:', error);
 });
 
+client.ws.on('error', (error) => {
+  console.error('WebSocket error:', error);
+});
+
 // =====================
-// 8) LOGIN (no final)
+// LOGIN (final do arquivo)
 // =====================
 client.login(TOKEN).catch((err) => {
   console.error('❌ Falha ao logar no Discord:', err);
