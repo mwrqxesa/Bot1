@@ -14,11 +14,11 @@ const GuildSettingsManager = require('./managers/GuildSettingsManager');
 const CallRankingManager = require('./managers/CallRankingManager');
 
 // =====================
-// TOKEN (aceita BOT_TOKEN ou DISCORD_TOKEN)
+// TOKEN
 // =====================
 const TOKEN = process.env.BOT_TOKEN || process.env.DISCORD_TOKEN;
 if (!TOKEN) {
-  console.error('❌ Nenhum token encontrado. Configure BOT_TOKEN (ou DISCORD_TOKEN) no ambiente.');
+  console.error('❌ Nenhum token encontrado. Configure BOT_TOKEN (ou DISCORD_TOKEN).');
   process.exit(1);
 }
 
@@ -31,7 +31,7 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates, // ✅ necessário para ranking de call
+    GatewayIntentBits.GuildVoiceStates, // ✅ necessário pro ranking de call
   ],
   shards: 'auto',
   failIfNotExists: false,
@@ -43,7 +43,9 @@ const client = new Client({
 
 client.commands = new Collection();
 
-// Managers / sistemas
+// =====================
+// MANAGERS / SISTEMAS
+// =====================
 client.licenses = new LicenseManager();
 client.clans = new ClanManager(client);
 client.players = new PlayerManager();
@@ -59,7 +61,7 @@ const commandFiles = fs.existsSync(commandsPath)
   ? fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'))
   : [];
 
-const commands = [];
+const commandsForAPI = [];
 
 for (const file of commandFiles) {
   const filePath = path.join(commandsPath, file);
@@ -72,41 +74,37 @@ for (const file of commandFiles) {
     continue;
   }
 
-  if ('data' in command && 'execute' in command) {
-    // Compatibilidade com objetos simples (sem SlashCommandBuilder)
-    if (typeof command.data === 'object' && typeof command.data.toJSON !== 'function') {
-      const { name, description, options = [] } = command.data;
-      command.data = {
-        name,
-        description,
-        options,
-        toJSON() {
-          return {
-            name: this.name,
-            description: this.description,
-            options: this.options,
-          };
-        },
-      };
-    }
-
-    try {
-      client.commands.set(command.data.name, command);
-      commands.push(command.data.toJSON());
-    } catch (err) {
-      console.warn(`[AVISO] Não foi possível registrar slash data do comando ${file}:`, err?.message || err);
-    }
-  } else {
+  if (!command || !('data' in command) || !('execute' in command)) {
     console.warn(`[AVISO] O comando em ${filePath} está faltando 'data' ou 'execute'.`);
+    continue;
+  }
+
+  // Compatibilidade com comandos em objeto simples
+  if (typeof command.data === 'object' && typeof command.data.toJSON !== 'function') {
+    const { name, description, options = [] } = command.data;
+    command.data = {
+      name,
+      description,
+      options,
+      toJSON() {
+        return {
+          name: this.name,
+          description: this.description,
+          options: this.options,
+        };
+      },
+    };
+  }
+
+  try {
+    client.commands.set(command.data.name, command);
+    commandsForAPI.push(command.data.toJSON());
+  } catch (err) {
+    console.warn(`[AVISO] Falha ao registrar slash do comando ${file}:`, err?.message || err);
   }
 }
 
 console.log(`✅ Comandos carregados: ${client.commands.size}`);
-
-// =====================
-// REGISTRO DE COMANDOS SLASH
-// =====================
-const rest = new REST({ version: '9' }).setToken(TOKEN);
 
 // =====================
 // LOAD EVENTS
@@ -142,16 +140,21 @@ for (const file of eventFiles) {
 console.log(`✅ Events carregados: ${eventFiles.length}`);
 
 // =====================
+// REGISTRO DE COMANDOS SLASH
+// =====================
+const rest = new REST({ version: '9' }).setToken(TOKEN);
+
+// =====================
 // READY
 // =====================
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot iniciado como ${client.user.tag}`);
 
-  // Registra comandos globalmente
+  // Registra slash commands (global)
   try {
     await rest.put(
       Routes.applicationCommands(client.user.id),
-      { body: commands },
+      { body: commandsForAPI }
     );
     console.log('✅ Comandos slash registrados com sucesso!');
   } catch (error) {
@@ -168,10 +171,9 @@ client.once(Events.ClientReady, async () => {
     await client.players.init();
     await client.clans.init();
 
-    // recria manager se seu projeto depende desse comportamento
+    // Se seu projeto depende dessa reinicialização
     client.recruitmentManager = new RecruitmentManager(client);
 
-    // Ranking de call
     await client.callRanking.init();
     console.log('✅ Ranking de call inicializado');
 
@@ -182,7 +184,7 @@ client.once(Events.ClientReady, async () => {
 });
 
 // =====================
-// INTERAÇÕES
+// INTERAÇÕES (slash, botões, modais)
 // =====================
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -245,15 +247,17 @@ client.on('interactionCreate', async (interaction) => {
 
         const channel = await interaction.guild?.channels.fetch(channelId).catch(() => null);
 
-        if (channel) {
-          interaction.channel = channel; // mantém sua lógica
-          await client.recruitmentManager.handlePanelEditModal(interaction);
-        } else {
+        if (!channel) {
           await interaction.reply({
             content: '❌ Canal não encontrado. O painel pode ter sido movido ou deletado.',
             ephemeral: true,
           });
+          return;
         }
+
+        // mantém sua lógica atual
+        interaction.channel = channel;
+        await client.recruitmentManager.handlePanelEditModal(interaction);
         return;
       }
 
@@ -283,11 +287,11 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // =====================
-// RANKING DE CALL (voice state)
+// TRACKING DE CALL (voice state)
 // =====================
 client.on('voiceStateUpdate', (oldState, newState) => {
   try {
-    client.callRanking?.onVoiceStateUpdate(oldState, newState);
+    client.callRanking?.handleVoiceStateUpdate(oldState, newState); // ✅ método correto
   } catch (err) {
     console.error('Erro no voiceStateUpdate do ranking:', err);
   }
