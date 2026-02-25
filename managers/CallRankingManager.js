@@ -5,61 +5,112 @@ const { EmbedBuilder } = require('discord.js');
 class CallRankingManager {
   constructor(client) {
     this.client = client;
-    this.dataDir = path.join(__dirname, '..', 'data');
-    this.file = path.join(this.dataDir, 'call_ranking.json');
 
-    // CONFIGURE AQUI 👇
+    this.dataDir = path.join(__dirname, '..', 'data');
+    this.filePath = path.join(this.dataDir, 'call_ranking.json');
+
+    // Sessões ativas: "guildId:userId" => timestamp de início
+    this.activeSessions = new Map();
+
+    // Atualização automática (5 min)
+    this.updateIntervalMs = 5 * 60 * 1000;
+    this.interval = null;
+
+    // Config via Railway Variables
     this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || null;
     this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null;
 
-    this.updateIntervalMs = 5 * 60 * 1000; // 5 min
-    this.activeSessions = new Map(); // key = guildId:userId => timestamp(ms)
+    // Estrutura persistida
     this.data = this.load();
-    this.interval = null;
   }
 
+  // =========================
+  // Persistência
+  // =========================
   ensureStorage() {
-    if (!fs.existsSync(this.dataDir)) fs.mkdirSync(this.dataDir, { recursive: true });
-    if (!fs.existsSync(this.file)) {
-      fs.writeFileSync(this.file, JSON.stringify({
+    if (!fs.existsSync(this.dataDir)) {
+      fs.mkdirSync(this.dataDir, { recursive: true });
+    }
+
+    if (!fs.existsSync(this.filePath)) {
+      const initial = {
         users: {},
         rankingMessageId: null,
-        lastResetAt: Date.now()
-      }, null, 2));
+      };
+      fs.writeFileSync(this.filePath, JSON.stringify(initial, null, 2));
     }
   }
 
   load() {
     this.ensureStorage();
     try {
-      return JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      const json = JSON.parse(raw);
+
+      // garante estrutura
+      if (!json.users || typeof json.users !== 'object') json.users = {};
+      if (!('rankingMessageId' in json)) json.rankingMessageId = null;
+
+      return json;
     } catch {
-      return { users: {}, rankingMessageId: null, lastResetAt: Date.now() };
+      return {
+        users: {},
+        rankingMessageId: null,
+      };
     }
   }
 
   save() {
     this.ensureStorage();
-    fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2));
+    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
   }
 
+  // =========================
+  // Helpers
+  // =========================
   key(guildId, userId) {
     return `${guildId}:${userId}`;
   }
 
-  isTrackable(member, newState) {
-    if (!member || member.user.bot) return false;
-    if (!newState.channelId) return false;
-    // ignora self-deaf/self-mute? (opcional)
-    return true;
+  formatMs(ms) {
+    const totalSec = Math.floor((ms || 0) / 1000);
+
+    const days = Math.floor(totalSec / 86400);
+    const hours = Math.floor((totalSec % 86400) / 3600);
+    const minutes = Math.floor((totalSec % 3600) / 60);
+
+    if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+  }
+
+  touchUser(user) {
+    if (!user || user.bot) return;
+
+    if (!this.data.users[user.id]) {
+      this.data.users[user.id] = {
+        username: user.username,
+        totalMs: 0,
+      };
+    } else {
+      this.data.users[user.id].username = user.username;
+    }
   }
 
   startSession(guildId, userId) {
-    this.activeSessions.set(this.key(guildId, userId), Date.now());
+    if (!guildId || !userId) return;
+    const k = this.key(guildId, userId);
+
+    // evita sobrescrever sessão já ativa
+    if (this.activeSessions.has(k)) return;
+
+    this.activeSessions.set(k, Date.now());
   }
 
   stopSession(guildId, userId) {
+    if (!guildId || !userId) return;
     const k = this.key(guildId, userId);
+
     const startedAt = this.activeSessions.get(k);
     if (!startedAt) return;
 
@@ -68,158 +119,218 @@ class CallRankingManager {
 
     if (!this.data.users[userId]) {
       this.data.users[userId] = {
+        username: `ID ${userId}`,
         totalMs: 0,
-        username: null,
-        updatedAt: Date.now()
       };
     }
 
     this.data.users[userId].totalMs += Math.max(0, elapsed);
-    this.data.users[userId].updatedAt = Date.now();
     this.save();
   }
 
-  syncUsername(user) {
-    if (!user || !this.data.users[user.id]) return;
-    this.data.users[user.id].username = user.username;
-  }
+  getLiveMs(userId) {
+    let live = 0;
 
-  handleVoiceStateUpdate(oldState, newState) {
-    const guildId = newState.guild?.id || oldState.guild?.id;
-    if (!guildId) return;
-
-    const member = newState.member || oldState.member;
-    const userId = member?.id;
-    if (!userId || member.user.bot) return;
-
-    const wasInVoice = !!oldState.channelId;
-    const isInVoice = !!newState.channelId;
-
-    // entrou
-    if (!wasInVoice && isInVoice) {
-      this.startSession(guildId, userId);
-      this.syncUsername(member.user);
-      this.save();
-      return;
+    for (const [k, startedAt] of this.activeSessions.entries()) {
+      const [, uid] = k.split(':');
+      if (uid === userId) {
+        live += (Date.now() - startedAt);
+      }
     }
 
-    // saiu
-    if (wasInVoice && !isInVoice) {
-      this.syncUsername(member.user);
-      this.stopSession(guildId, userId);
-      return;
-    }
-
-    // trocou de canal -> mantém sessão (continua)
-    if (wasInVoice && isInVoice && oldState.channelId !== newState.channelId) {
-      this.syncUsername(member.user);
-      return;
-    }
+    return live;
   }
 
   getTotalWithLiveMs(userId) {
     const base = this.data.users[userId]?.totalMs || 0;
-    let live = 0;
+    return base + this.getLiveMs(userId);
+  }
 
-    // soma sessão ativa (se houver)
-    for (const [key, startedAt] of this.activeSessions.entries()) {
-      const [, uid] = key.split(':');
-      if (uid === userId) live += (Date.now() - startedAt);
+  // =========================
+  // Voice tracking
+  // =========================
+  isTrackableMember(member) {
+    return !!member && !member.user?.bot;
+  }
+
+  handleVoiceStateUpdate(oldState, newState) {
+    const member = newState.member || oldState.member;
+    if (!this.isTrackableMember(member)) return;
+
+    const guildId = newState.guild?.id || oldState.guild?.id;
+    const userId = member.id;
+    if (!guildId || !userId) return;
+
+    const wasInVoice = !!oldState.channelId;
+    const isInVoice = !!newState.channelId;
+
+    // sincroniza username no banco
+    this.touchUser(member.user);
+
+    // Entrou em call
+    if (!wasInVoice && isInVoice) {
+      this.startSession(guildId, userId);
+      this.save();
+      return;
     }
 
-    return base + live;
+    // Saiu da call
+    if (wasInVoice && !isInVoice) {
+      this.stopSession(guildId, userId);
+      return;
+    }
+
+    // Trocou de call (continua contando)
+    if (wasInVoice && isInVoice && oldState.channelId !== newState.channelId) {
+      // mantém a sessão ativa sem resetar
+      this.save();
+      return;
+    }
+
+    // Outras mudanças (mute/deafen/stream/etc) — mantém sessão
+    this.save();
   }
 
-  formatMs(ms) {
-    const totalSec = Math.floor(ms / 1000);
-    const d = Math.floor(totalSec / 86400);
-    const h = Math.floor((totalSec % 86400) / 3600);
-    const m = Math.floor((totalSec % 3600) / 60);
-
-    if (d > 0) return `${d}d ${h}h ${m}m`;
-    if (h > 0) return `${h}h ${m}m`;
-    return `${m}m`;
-  }
-
+  // =========================
+  // Embed / UI
+  // =========================
   buildEmbed(guild) {
-    const users = Object.keys(this.data.users).map(userId => {
-      const totalMs = this.getTotalWithLiveMs(userId);
-      const username = this.data.users[userId]?.username || `ID ${userId}`;
-      return { userId, username, totalMs };
-    });
+    const ranking = Object.keys(this.data.users)
+      .map(userId => ({
+        userId,
+        username: this.data.users[userId]?.username || `ID ${userId}`,
+        totalMs: this.getTotalWithLiveMs(userId),
+      }))
+      .sort((a, b) => b.totalMs - a.totalMs);
 
-    users.sort((a, b) => b.totalMs - a.totalMs);
+    const top = ranking.slice(0, 15);
 
-    const top = users.slice(0, 15);
     const lines = top.length
       ? top.map((u, i) => {
-          const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `**#${i + 1}**`;
-          return `${medal} <@${u.userId}> • **${this.formatMs(u.totalMs)}**`;
-        })
-      : ['Nenhum tempo registrado ainda.'];
+          const pos =
+            i === 0 ? '🥇' :
+            i === 1 ? '🥈' :
+            i === 2 ? '🥉' :
+            `\`${String(i + 1).padStart(2, '0')}\``;
+
+          return `${pos} <@${u.userId}> — **${this.formatMs(u.totalMs)}**`;
+        }).join('\n')
+      : 'Ninguém entrou em call ainda.';
 
     const onlineNow = [...this.activeSessions.keys()]
       .filter(k => k.startsWith(`${guild.id}:`)).length;
 
+    const lastUpdate = new Date().toLocaleString('pt-BR', {
+      timeZone: 'America/Sao_Paulo',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+
     return new EmbedBuilder()
-      .setTitle('📞 Ranking de Tempo em Call')
+      .setTitle('📞 Ranking de Horas em Call')
       .setColor('#0099ff')
-      .setDescription(lines.join('\n'))
+      .setDescription([
+        '### 🏆 Top membros em call',
+        lines
+      ].join('\n\n'))
       .addFields(
-        { name: '👥 Em call agora', value: String(onlineNow), inline: true },
-        { name: '🔄 Atualiza a cada', value: '5 minutos', inline: true }
+        {
+          name: '👥 Em call agora',
+          value: `**${onlineNow}** membro(s)`,
+          inline: true
+        },
+        {
+          name: '🔄 Atualização',
+          value: 'A cada **5 minutos**',
+          inline: true
+        },
+        {
+          name: '🕒 Última atualização',
+          value: lastUpdate,
+          inline: false
+        }
       )
       .setFooter({ text: 'Desenvolvido por Lynn' })
       .setTimestamp();
   }
 
+  // =========================
+  // Mensagem do ranking
+  // =========================
   async updateRankingMessage() {
-    if (!this.targetGuildId || !this.targetChannelId) return;
+    if (!this.targetGuildId || !this.targetChannelId) {
+      console.warn('[CallRanking] CALL_RANKING_GUILD_ID / CALL_RANKING_CHANNEL_ID não configurados.');
+      return;
+    }
 
     const guild = await this.client.guilds.fetch(this.targetGuildId).catch(() => null);
-    if (!guild) return;
+    if (!guild) {
+      console.warn('[CallRanking] Servidor não encontrado:', this.targetGuildId);
+      return;
+    }
 
     const channel = await guild.channels.fetch(this.targetChannelId).catch(() => null);
-    if (!channel || !channel.isTextBased?.()) return;
+    if (!channel || !channel.isTextBased?.()) {
+      console.warn('[CallRanking] Canal inválido ou não é de texto:', this.targetChannelId);
+      return;
+    }
 
     const embed = this.buildEmbed(guild);
 
-    // tenta editar a mensagem fixa
+    // Tenta editar mensagem existente
     if (this.data.rankingMessageId) {
       const msg = await channel.messages.fetch(this.data.rankingMessageId).catch(() => null);
       if (msg) {
-        await msg.edit({ embeds: [embed] }).catch(() => {});
+        await msg.edit({ embeds: [embed] }).catch((err) => {
+          console.error('[CallRanking] Falha ao editar mensagem:', err);
+        });
         return;
       }
     }
 
-    // se não existir, cria
-    const newMsg = await channel.send({ embeds: [embed] }).catch(() => null);
+    // Se não existir, cria uma nova
+    const newMsg = await channel.send({ embeds: [embed] }).catch((err) => {
+      console.error('[CallRanking] Falha ao enviar mensagem:', err);
+      return null;
+    });
+
     if (newMsg) {
       this.data.rankingMessageId = newMsg.id;
       this.save();
     }
   }
 
+  // =========================
+  // Init
+  // =========================
   async init() {
-    // Inicializa sessões para quem já está em call quando o bot liga
+    // Captura quem já está em call quando o bot liga
     for (const guild of this.client.guilds.cache.values()) {
-      for (const [_, vs] of guild.voiceStates.cache) {
-        if (vs.channelId && vs.member && !vs.member.user.bot) {
-          this.startSession(guild.id, vs.id);
-          this.syncUsername(vs.member.user);
+      for (const voiceState of guild.voiceStates.cache.values()) {
+        if (voiceState.channelId && voiceState.member && !voiceState.member.user.bot) {
+          this.touchUser(voiceState.member.user);
+          this.startSession(guild.id, voiceState.id);
         }
       }
     }
+
     this.save();
 
-    // Atualização periódica
-    this.interval = setInterval(() => {
-      this.updateRankingMessage().catch(err => console.error('CallRanking update error:', err));
-    }, this.updateIntervalMs);
+    // Atualiza imediatamente ao iniciar
+    await this.updateRankingMessage().catch((err) => {
+      console.error('[CallRanking] Erro na atualização inicial:', err);
+    });
 
-    // Atualiza ao iniciar
-    await this.updateRankingMessage().catch(() => {});
+    // Atualiza a cada 5 min
+    if (this.interval) clearInterval(this.interval);
+    this.interval = setInterval(() => {
+      this.updateRankingMessage().catch((err) => {
+        console.error('[CallRanking] Erro na atualização periódica:', err);
+      });
+    }, this.updateIntervalMs);
   }
 }
 
