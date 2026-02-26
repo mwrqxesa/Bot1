@@ -51,7 +51,6 @@ class CallRankingManager {
     } catch (err) {
       console.warn('[CallRanking] Erro ao ler JSON principal, tentando backup...', err?.message || err);
 
-      // tenta carregar backup se principal falhar
       try {
         if (fs.existsSync(this.backupPath)) {
           const rawBackup = fs.readFileSync(this.backupPath, 'utf8');
@@ -77,7 +76,6 @@ class CallRankingManager {
   save() {
     this.ensureStorage();
 
-    // cria backup do arquivo atual antes de sobrescrever
     try {
       if (fs.existsSync(this.filePath)) {
         fs.copyFileSync(this.filePath, this.backupPath);
@@ -209,15 +207,79 @@ class CallRankingManager {
     return false;
   }
 
+  // =========================
+  // CORES DOS CARGOS POR HORAS
+  // =========================
+  getCallLevelRoleHours(roleName) {
+    if (!roleName) return null;
+    const n = parseInt(String(roleName).replace('h', ''), 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  getCallLevelRoleColor(roleName) {
+    const hours = this.getCallLevelRoleHours(roleName);
+    if (!hours) return 0x99aab5; // fallback cinza
+
+    // Paleta de 10h..100h
+    const palette10to100 = {
+      10: 0x95a5a6, // cinza
+      20: 0x3498db, // azul
+      30: 0x5865f2, // azul-roxo
+      40: 0x9b59b6, // roxo
+      50: 0xe91e63, // rosa
+      60: 0xe74c3c, // vermelho
+      70: 0xe67e22, // laranja
+      80: 0xf1c40f, // amarelo
+      90: 0x2ecc71, // verde
+      100: 0xf39c12 // dourado
+    };
+
+    if (hours >= 10 && hours <= 100) {
+      return palette10to100[hours] || 0x99aab5;
+    }
+
+    // 200h+ (ciclo premium)
+    const premiumCycle = [
+      0xf39c12, // dourado
+      0xe91e63, // rosa
+      0x9b59b6, // roxo
+      0x3498db, // azul
+      0x1abc9c, // turquesa
+      0x2ecc71, // verde
+      0xe67e22, // laranja
+      0xe74c3c  // vermelho
+    ];
+
+    const idx = Math.floor((hours - 200) / 100) % premiumCycle.length;
+    return premiumCycle[Math.max(0, idx)];
+  }
+
   async ensureCallLevelRole(guild, roleName) {
     if (!guild || !roleName) return null;
 
+    const targetColor = this.getCallLevelRoleColor(roleName);
+
     let role = guild.roles.cache.find(r => r.name === roleName);
-    if (role) return role;
+
+    // Se já existe, sincroniza a cor (opcional, mas útil)
+    if (role) {
+      try {
+        if (role.color !== targetColor) {
+          await role.edit({
+            color: targetColor,
+            reason: 'Sincronizando cor do cargo de horas em call'
+          });
+        }
+      } catch (err) {
+        console.error(`[CallRanking] Erro ao sincronizar cor do cargo ${roleName}:`, err);
+      }
+      return role;
+    }
 
     try {
       role = await guild.roles.create({
         name: roleName,
+        color: targetColor,
         reason: 'Sistema automático de cargos por horas em call',
         mentionable: false,
         hoist: false,
