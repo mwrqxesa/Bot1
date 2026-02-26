@@ -8,24 +8,20 @@ class CallRankingManager {
 
     this.dataDir = path.join(__dirname, '..', 'data');
     this.filePath = path.join(this.dataDir, 'call_ranking.json');
+    this.backupPath = path.join(this.dataDir, 'call_ranking.backup.json');
 
-    // Sessões ativas: "guildId:userId" => timestamp de início
-    this.activeSessions = new Map();
-
-    // Atualização automática (5 min)
-    this.updateIntervalMs = 5 * 60 * 1000;
+    this.activeSessions = new Map(); // guildId:userId => timestamp
     this.interval = null;
+    this.updateIntervalMs = 5 * 60 * 1000; // 5 min
 
-    // Config via Railway Variables
     this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || null;
     this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null;
 
-    // Estrutura persistida
     this.data = this.load();
   }
 
   // =========================
-  // Persistência
+  // STORAGE
   // =========================
   ensureStorage() {
     if (!fs.existsSync(this.dataDir)) {
@@ -43,16 +39,34 @@ class CallRankingManager {
 
   load() {
     this.ensureStorage();
+
     try {
       const raw = fs.readFileSync(this.filePath, 'utf8');
       const json = JSON.parse(raw);
 
-      // garante estrutura
       if (!json.users || typeof json.users !== 'object') json.users = {};
       if (!('rankingMessageId' in json)) json.rankingMessageId = null;
 
       return json;
-    } catch {
+    } catch (err) {
+      console.warn('[CallRanking] Erro ao ler JSON principal, tentando backup...', err?.message || err);
+
+      // tenta carregar backup se principal falhar
+      try {
+        if (fs.existsSync(this.backupPath)) {
+          const rawBackup = fs.readFileSync(this.backupPath, 'utf8');
+          const backupJson = JSON.parse(rawBackup);
+
+          if (!backupJson.users || typeof backupJson.users !== 'object') backupJson.users = {};
+          if (!('rankingMessageId' in backupJson)) backupJson.rankingMessageId = null;
+
+          console.log('[CallRanking] Backup carregado com sucesso.');
+          return backupJson;
+        }
+      } catch (backupErr) {
+        console.warn('[CallRanking] Backup também falhou:', backupErr?.message || backupErr);
+      }
+
       return {
         users: {},
         rankingMessageId: null,
@@ -62,11 +76,22 @@ class CallRankingManager {
 
   save() {
     this.ensureStorage();
+
+    // 1) cria backup do arquivo atual (antes de sobrescrever)
+    try {
+      if (fs.existsSync(this.filePath)) {
+        fs.copyFileSync(this.filePath, this.backupPath);
+      }
+    } catch (err) {
+      console.warn('[CallRanking] Falha ao criar backup:', err?.message || err);
+    }
+
+    // 2) salva o arquivo principal
     fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
   }
 
   // =========================
-  // Helpers
+  // HELPERS
   // =========================
   key(guildId, userId) {
     return `${guildId}:${userId}`;
@@ -98,19 +123,13 @@ class CallRankingManager {
   }
 
   startSession(guildId, userId) {
-    if (!guildId || !userId) return;
     const k = this.key(guildId, userId);
-
-    // evita sobrescrever sessão já ativa
     if (this.activeSessions.has(k)) return;
-
     this.activeSessions.set(k, Date.now());
   }
 
   stopSession(guildId, userId) {
-    if (!guildId || !userId) return;
     const k = this.key(guildId, userId);
-
     const startedAt = this.activeSessions.get(k);
     if (!startedAt) return;
 
@@ -147,15 +166,11 @@ class CallRankingManager {
   }
 
   // =========================
-  // Voice tracking
+  // VOICE TRACKING
   // =========================
-  isTrackableMember(member) {
-    return !!member && !member.user?.bot;
-  }
-
   handleVoiceStateUpdate(oldState, newState) {
     const member = newState.member || oldState.member;
-    if (!this.isTrackableMember(member)) return;
+    if (!member || member.user.bot) return;
 
     const guildId = newState.guild?.id || oldState.guild?.id;
     const userId = member.id;
@@ -164,35 +179,27 @@ class CallRankingManager {
     const wasInVoice = !!oldState.channelId;
     const isInVoice = !!newState.channelId;
 
-    // sincroniza username no banco
     this.touchUser(member.user);
 
-    // Entrou em call
+    // entrou
     if (!wasInVoice && isInVoice) {
       this.startSession(guildId, userId);
       this.save();
       return;
     }
 
-    // Saiu da call
+    // saiu
     if (wasInVoice && !isInVoice) {
       this.stopSession(guildId, userId);
       return;
     }
 
-    // Trocou de call (continua contando)
-    if (wasInVoice && isInVoice && oldState.channelId !== newState.channelId) {
-      // mantém a sessão ativa sem resetar
-      this.save();
-      return;
-    }
-
-    // Outras mudanças (mute/deafen/stream/etc) — mantém sessão
+    // trocou de canal ou alterou estado (continua contando)
     this.save();
   }
 
   // =========================
-  // Embed / UI
+  // EMBED
   // =========================
   buildEmbed(guild) {
     const ranking = Object.keys(this.data.users)
@@ -258,11 +265,11 @@ class CallRankingManager {
   }
 
   // =========================
-  // Mensagem do ranking
+  // UPDATE MESSAGE
   // =========================
   async updateRankingMessage() {
     if (!this.targetGuildId || !this.targetChannelId) {
-      console.warn('[CallRanking] CALL_RANKING_GUILD_ID / CALL_RANKING_CHANNEL_ID não configurados.');
+      console.warn('[CallRanking] IDs de guild/canal não configurados.');
       return;
     }
 
@@ -274,26 +281,24 @@ class CallRankingManager {
 
     const channel = await guild.channels.fetch(this.targetChannelId).catch(() => null);
     if (!channel || !channel.isTextBased?.()) {
-      console.warn('[CallRanking] Canal inválido ou não é de texto:', this.targetChannelId);
+      console.warn('[CallRanking] Canal inválido:', this.targetChannelId);
       return;
     }
 
     const embed = this.buildEmbed(guild);
 
-    // Tenta editar mensagem existente
     if (this.data.rankingMessageId) {
       const msg = await channel.messages.fetch(this.data.rankingMessageId).catch(() => null);
       if (msg) {
-        await msg.edit({ embeds: [embed] }).catch((err) => {
-          console.error('[CallRanking] Falha ao editar mensagem:', err);
+        await msg.edit({ embeds: [embed] }).catch(err => {
+          console.error('[CallRanking] Erro ao editar mensagem:', err);
         });
         return;
       }
     }
 
-    // Se não existir, cria uma nova
-    const newMsg = await channel.send({ embeds: [embed] }).catch((err) => {
-      console.error('[CallRanking] Falha ao enviar mensagem:', err);
+    const newMsg = await channel.send({ embeds: [embed] }).catch(err => {
+      console.error('[CallRanking] Erro ao enviar mensagem:', err);
       return null;
     });
 
@@ -304,10 +309,10 @@ class CallRankingManager {
   }
 
   // =========================
-  // Init
+  // INIT
   // =========================
   async init() {
-    // Captura quem já está em call quando o bot liga
+    // captura membros já em call ao ligar o bot
     for (const guild of this.client.guilds.cache.values()) {
       for (const voiceState of guild.voiceStates.cache.values()) {
         if (voiceState.channelId && voiceState.member && !voiceState.member.user.bot) {
@@ -319,15 +324,16 @@ class CallRankingManager {
 
     this.save();
 
-    // Atualiza imediatamente ao iniciar
-    await this.updateRankingMessage().catch((err) => {
+    // atualiza mensagem imediatamente
+    await this.updateRankingMessage().catch(err => {
       console.error('[CallRanking] Erro na atualização inicial:', err);
     });
 
-    // Atualiza a cada 5 min
+    // loop de atualização
     if (this.interval) clearInterval(this.interval);
+
     this.interval = setInterval(() => {
-      this.updateRankingMessage().catch((err) => {
+      this.updateRankingMessage().catch(err => {
         console.error('[CallRanking] Erro na atualização periódica:', err);
       });
     }, this.updateIntervalMs);
