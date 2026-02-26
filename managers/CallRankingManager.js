@@ -76,6 +76,7 @@ class CallRankingManager {
   save() {
     this.ensureStorage();
 
+    // backup do arquivo atual antes de sobrescrever
     try {
       if (fs.existsSync(this.filePath)) {
         fs.copyFileSync(this.filePath, this.backupPath);
@@ -143,7 +144,7 @@ class CallRankingManager {
     this.data.users[userId].totalMs += Math.max(0, elapsed);
     this.save();
 
-    // Atualiza cargo de nível ao sair da call (ganha cargo imediatamente)
+    // Atualiza cargo imediatamente ao sair da call (se for o servidor alvo)
     if (this.targetGuildId && String(guildId) === String(this.targetGuildId)) {
       const guild = this.client.guilds.cache.get(guildId) || null;
       this.updateMemberCallLevelRole(guild, userId).catch(() => {});
@@ -168,100 +169,139 @@ class CallRankingManager {
     return base + this.getLiveMs(userId);
   }
 
-  // =========================
-  // CARGOS POR HORAS EM CALL
-  // =========================
   getCallHours(totalMs) {
     return Number(totalMs || 0) / 3600000;
   }
 
-  // Regras:
-  // 10h, 20h, ..., 100h
-  // depois 200h, 300h, 400h...
-  getCallLevelRoleName(totalMs) {
+  // =========================
+  // RANKS DE CALL (DARK ANIME)
+  // Regra: 10..90 (de 10 em 10) e 100..1000 (de 100 em 100)
+  // =========================
+  getCallRankMap() {
+    return {
+      10: 'Novato',
+      20: 'Desperto',
+      30: 'Vigilante',
+      40: 'Executor',
+      50: 'Tenente',
+      60: 'Magnífico',
+      70: 'Ceifador',
+      80: 'Portador do Véu',
+      90: 'Anbu',
+      100: 'Magnata',
+      200: 'Patriarca',
+      300: 'Shogun',
+      400: 'Imperador',
+      500: 'Lenda',
+      600: 'Soberano',
+      700: 'Fantasma',
+      800: 'O Escolhido',
+      900: 'Yakuza Suprema',
+      1000: 'Monarca das Calls'
+    };
+  }
+
+  getCallMilestones() {
+    return Object.keys(this.getCallRankMap())
+      .map(Number)
+      .sort((a, b) => a - b);
+  }
+
+  // Retorna dados do cargo alvo atingido pelo usuário
+  // ex: { milestone: 100, title: 'Magnata' }
+  getCallLevelRoleData(totalMs) {
     const hours = this.getCallHours(totalMs);
+    const milestones = this.getCallMilestones();
+    const rankMap = this.getCallRankMap();
 
     if (hours < 10) return null;
 
-    if (hours <= 100) {
-      const step = Math.floor(hours / 10) * 10;
-      return `${step}h`;
+    let reached = null;
+    for (const h of milestones) {
+      if (hours >= h) reached = h;
+      else break;
     }
 
-    const step = Math.floor(hours / 100) * 100;
-    return `${step}h`;
+    if (!reached) return null;
+
+    return {
+      milestone: reached,
+      title: rankMap[reached] || `${reached}h`,
+    };
   }
 
+  // Template FIXO que você pediu (trocando só o nome)
+  formatCallRoleName(hours, title) {
+    const baseName = title || `${hours}h`;
+    return `友𝅙𝅙﹒𝅙𝅙𑊑\`🪭\`ﾞ𝅙𝅙—ㅤ𝐃﹒${baseName}ㅤ﹑𝅙𝅙る`;
+  }
+
+  // Verifica se um cargo pertence ao sistema de horas em call (pelos nomes formatados)
   isCallLevelRoleName(roleName) {
     if (!roleName || typeof roleName !== 'string') return false;
 
-    // 10h..100h
-    if (/^(10|20|30|40|50|60|70|80|90|100)h$/.test(roleName)) return true;
+    const rankMap = this.getCallRankMap();
+    const allPossibleNames = Object.entries(rankMap).map(([hours, title]) =>
+      this.formatCallRoleName(Number(hours), title)
+    );
 
-    // 200h, 300h, 400h...
-    if (/^[1-9]\d{2,}h$/.test(roleName)) {
-      const n = parseInt(roleName.replace('h', ''), 10);
-      return n >= 200 && n % 100 === 0;
+    return allPossibleNames.includes(roleName);
+  }
+
+  // Descobre o milestone (horas) a partir do nome do cargo formatado
+  getCallLevelRoleHours(roleName) {
+    if (!roleName) return null;
+
+    const rankMap = this.getCallRankMap();
+    for (const [hours, title] of Object.entries(rankMap)) {
+      const expected = this.formatCallRoleName(Number(hours), title);
+      if (expected === roleName) return Number(hours);
     }
 
-    return false;
+    return null;
   }
 
   // =========================
   // CORES DOS CARGOS POR HORAS
+  // (por milestone)
   // =========================
-  getCallLevelRoleHours(roleName) {
-    if (!roleName) return null;
-    const n = parseInt(String(roleName).replace('h', ''), 10);
-    return Number.isFinite(n) ? n : null;
-  }
-
   getCallLevelRoleColor(roleName) {
     const hours = this.getCallLevelRoleHours(roleName);
     if (!hours) return 0x99aab5; // fallback cinza
 
-    // Paleta de 10h..100h
-    const palette10to100 = {
-      10: 0x95a5a6, // cinza
-      20: 0x3498db, // azul
-      30: 0x5865f2, // azul-roxo
-      40: 0x9b59b6, // roxo
-      50: 0xe91e63, // rosa
-      60: 0xe74c3c, // vermelho
-      70: 0xe67e22, // laranja
-      80: 0xf1c40f, // amarelo
-      90: 0x2ecc71, // verde
-      100: 0xf39c12 // dourado
+    // Paleta visual por marcos
+    const colors = {
+      10: 0x7f8c8d,   // cinza
+      20: 0x3498db,   // azul
+      30: 0x5865f2,   // azul-roxo
+      40: 0x9b59b6,   // roxo
+      50: 0xe91e63,   // rosa
+      60: 0x8e44ad,   // roxo profundo
+      70: 0xc0392b,   // vermelho escuro
+      80: 0x2c3e50,   // azul escuro (véu)
+      90: 0x16a085,   // verde/teal
+      100: 0xf39c12,  // dourado
+      200: 0xd35400,  // laranja queimado
+      300: 0x8e44ad,  // roxo imperial
+      400: 0x2c3e50,  // grafite
+      500: 0xf1c40f,  // ouro
+      600: 0x1abc9c,  // turquesa
+      700: 0x34495e,  // sombra
+      800: 0xecf0f1,  // claro/escolhido
+      900: 0xe74c3c,  // vermelho supremo
+      1000: 0xffffff, // branco monarca
     };
 
-    if (hours >= 10 && hours <= 100) {
-      return palette10to100[hours] || 0x99aab5;
-    }
-
-    // 200h+ (ciclo premium)
-    const premiumCycle = [
-      0xf39c12, // dourado
-      0xe91e63, // rosa
-      0x9b59b6, // roxo
-      0x3498db, // azul
-      0x1abc9c, // turquesa
-      0x2ecc71, // verde
-      0xe67e22, // laranja
-      0xe74c3c  // vermelho
-    ];
-
-    const idx = Math.floor((hours - 200) / 100) % premiumCycle.length;
-    return premiumCycle[Math.max(0, idx)];
+    return colors[hours] || 0x99aab5;
   }
 
   async ensureCallLevelRole(guild, roleName) {
     if (!guild || !roleName) return null;
 
     const targetColor = this.getCallLevelRoleColor(roleName);
-
     let role = guild.roles.cache.find(r => r.name === roleName);
 
-    // Se já existe, sincroniza a cor (opcional, mas útil)
+    // Se já existe, sincroniza a cor
     if (role) {
       try {
         if (role.color !== targetColor) {
@@ -300,12 +340,12 @@ class CallRankingManager {
     if (!member || member.user.bot) return;
 
     const totalMs = this.getTotalWithLiveMs(userId);
-    const targetRoleName = this.getCallLevelRoleName(totalMs);
+    const targetRoleData = this.getCallLevelRoleData(totalMs);
 
     const currentCallRoles = member.roles.cache.filter(r => this.isCallLevelRoleName(r.name));
 
-    // Se ainda não chegou em 10h, remove cargos de call antigos
-    if (!targetRoleName) {
+    // Ainda não chegou em 10h -> remove cargos antigos de call (se tiver)
+    if (!targetRoleData) {
       if (currentCallRoles.size > 0) {
         await member.roles.remove(currentCallRoles).catch(err => {
           console.error(`[CallRanking] Erro ao remover cargos de call de ${member.user.tag}:`, err);
@@ -314,10 +354,11 @@ class CallRankingManager {
       return;
     }
 
+    const targetRoleName = this.formatCallRoleName(targetRoleData.milestone, targetRoleData.title);
     const targetRole = await this.ensureCallLevelRole(guild, targetRoleName);
     if (!targetRole) return;
 
-    // remove cargos antigos (menos o atual)
+    // Remove cargos antigos de call (exceto o atual)
     const toRemove = currentCallRoles.filter(r => r.id !== targetRole.id);
     if (toRemove.size > 0) {
       await member.roles.remove(toRemove).catch(err => {
@@ -325,7 +366,7 @@ class CallRankingManager {
       });
     }
 
-    // adiciona o cargo correto
+    // Adiciona cargo correto
     if (!member.roles.cache.has(targetRole.id)) {
       await member.roles.add(targetRole).catch(err => {
         console.error(`[CallRanking] Erro ao adicionar cargo ${targetRoleName} para ${member.user.tag}:`, err);
@@ -374,7 +415,7 @@ class CallRankingManager {
       return;
     }
 
-    // trocou de canal ou alterou estado (continua contando)
+    // trocou de canal / mudou estado (continua contando)
     this.save();
   }
 
@@ -491,7 +532,7 @@ class CallRankingManager {
       }
     }
 
-    // sincroniza cargos por horas em call
+    // Sincroniza cargos automáticos após atualizar o ranking
     await this.updateAllCallLevelRoles().catch(err => {
       console.error('[CallRanking] Erro ao sincronizar cargos de nível:', err);
     });
@@ -513,12 +554,584 @@ class CallRankingManager {
 
     this.save();
 
-    // atualiza mensagem imediatamente
+    // Atualização inicial
     await this.updateRankingMessage().catch(err => {
       console.error('[CallRanking] Erro na atualização inicial:', err);
     });
 
-    // loop de atualização
+    // Loop de atualização
+    if (this.interval) clearInterval(this.interval);
+
+    this.interval = setInterval(() => {
+      this.updateRankingMessage().catch(err => {
+        console.error('[CallRanking] Erro na atualização periódica:', err);
+      });
+    }, this.updateIntervalMs);
+  }
+}
+
+module.exports = CallRankingManager;const fs = require('node:fs');
+const path = require('node:path');
+const { EmbedBuilder } = require('discord.js');
+
+class CallRankingManager {
+  constructor(client) {
+    this.client = client;
+
+    this.dataDir = path.join(__dirname, '..', 'data');
+    this.filePath = path.join(this.dataDir, 'call_ranking.json');
+    this.backupPath = path.join(this.dataDir, 'call_ranking.backup.json');
+
+    this.activeSessions = new Map(); // guildId:userId => timestamp
+    this.interval = null;
+    this.updateIntervalMs = 5 * 60 * 1000; // 5 min
+
+    this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || null;
+    this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null;
+
+    this.data = this.load();
+  }
+
+  // =========================
+  // STORAGE
+  // =========================
+  ensureStorage() {
+    if (!fs.existsSync(this.dataDir)) {
+      fs.mkdirSync(this.dataDir, { recursive: true });
+    }
+
+    if (!fs.existsSync(this.filePath)) {
+      const initial = {
+        users: {},
+        rankingMessageId: null,
+      };
+      fs.writeFileSync(this.filePath, JSON.stringify(initial, null, 2));
+    }
+  }
+
+  load() {
+    this.ensureStorage();
+
+    try {
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      const json = JSON.parse(raw);
+
+      if (!json.users || typeof json.users !== 'object') json.users = {};
+      if (!('rankingMessageId' in json)) json.rankingMessageId = null;
+
+      return json;
+    } catch (err) {
+      console.warn('[CallRanking] Erro ao ler JSON principal, tentando backup...', err?.message || err);
+
+      try {
+        if (fs.existsSync(this.backupPath)) {
+          const rawBackup = fs.readFileSync(this.backupPath, 'utf8');
+          const backupJson = JSON.parse(rawBackup);
+
+          if (!backupJson.users || typeof backupJson.users !== 'object') backupJson.users = {};
+          if (!('rankingMessageId' in backupJson)) backupJson.rankingMessageId = null;
+
+          console.log('[CallRanking] Backup carregado com sucesso.');
+          return backupJson;
+        }
+      } catch (backupErr) {
+        console.warn('[CallRanking] Backup também falhou:', backupErr?.message || backupErr);
+      }
+
+      return {
+        users: {},
+        rankingMessageId: null,
+      };
+    }
+  }
+
+  save() {
+    this.ensureStorage();
+
+    // backup do arquivo atual antes de sobrescrever
+    try {
+      if (fs.existsSync(this.filePath)) {
+        fs.copyFileSync(this.filePath, this.backupPath);
+      }
+    } catch (err) {
+      console.warn('[CallRanking] Falha ao criar backup:', err?.message || err);
+    }
+
+    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+  }
+
+  // =========================
+  // HELPERS
+  // =========================
+  key(guildId, userId) {
+    return `${guildId}:${userId}`;
+  }
+
+  formatMs(ms) {
+    const totalSec = Math.floor((ms || 0) / 1000);
+
+    const days = Math.floor(totalSec / 86400);
+    const hours = Math.floor((totalSec % 86400) / 3600);
+    const minutes = Math.floor((totalSec % 3600) / 60);
+
+    if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+  }
+
+  touchUser(user) {
+    if (!user || user.bot) return;
+
+    if (!this.data.users[user.id]) {
+      this.data.users[user.id] = {
+        username: user.username,
+        totalMs: 0,
+      };
+    } else {
+      this.data.users[user.id].username = user.username;
+    }
+  }
+
+  startSession(guildId, userId) {
+    const k = this.key(guildId, userId);
+    if (this.activeSessions.has(k)) return;
+    this.activeSessions.set(k, Date.now());
+  }
+
+  stopSession(guildId, userId) {
+    const k = this.key(guildId, userId);
+    const startedAt = this.activeSessions.get(k);
+    if (!startedAt) return;
+
+    const elapsed = Date.now() - startedAt;
+    this.activeSessions.delete(k);
+
+    if (!this.data.users[userId]) {
+      this.data.users[userId] = {
+        username: `ID ${userId}`,
+        totalMs: 0,
+      };
+    }
+
+    this.data.users[userId].totalMs += Math.max(0, elapsed);
+    this.save();
+
+    // Atualiza cargo imediatamente ao sair da call (se for o servidor alvo)
+    if (this.targetGuildId && String(guildId) === String(this.targetGuildId)) {
+      const guild = this.client.guilds.cache.get(guildId) || null;
+      this.updateMemberCallLevelRole(guild, userId).catch(() => {});
+    }
+  }
+
+  getLiveMs(userId) {
+    let live = 0;
+
+    for (const [k, startedAt] of this.activeSessions.entries()) {
+      const [, uid] = k.split(':');
+      if (uid === userId) {
+        live += (Date.now() - startedAt);
+      }
+    }
+
+    return live;
+  }
+
+  getTotalWithLiveMs(userId) {
+    const base = this.data.users[userId]?.totalMs || 0;
+    return base + this.getLiveMs(userId);
+  }
+
+  getCallHours(totalMs) {
+    return Number(totalMs || 0) / 3600000;
+  }
+
+  // =========================
+  // RANKS DE CALL (DARK ANIME)
+  // Regra: 10..90 (de 10 em 10) e 100..1000 (de 100 em 100)
+  // =========================
+  getCallRankMap() {
+    return {
+      10: 'Novato',
+      20: 'Desperto',
+      30: 'Vigilante',
+      40: 'Executor',
+      50: 'Tenente',
+      60: 'Magnífico',
+      70: 'Ceifador',
+      80: 'Portador do Véu',
+      90: 'Anbu',
+      100: 'Magnata',
+      200: 'Patriarca',
+      300: 'Shogun',
+      400: 'Imperador',
+      500: 'Lenda',
+      600: 'Soberano',
+      700: 'Fantasma',
+      800: 'O Escolhido',
+      900: 'Yakuza Suprema',
+      1000: 'Monarca das Calls'
+    };
+  }
+
+  getCallMilestones() {
+    return Object.keys(this.getCallRankMap())
+      .map(Number)
+      .sort((a, b) => a - b);
+  }
+
+  // Retorna dados do cargo alvo atingido pelo usuário
+  // ex: { milestone: 100, title: 'Magnata' }
+  getCallLevelRoleData(totalMs) {
+    const hours = this.getCallHours(totalMs);
+    const milestones = this.getCallMilestones();
+    const rankMap = this.getCallRankMap();
+
+    if (hours < 10) return null;
+
+    let reached = null;
+    for (const h of milestones) {
+      if (hours >= h) reached = h;
+      else break;
+    }
+
+    if (!reached) return null;
+
+    return {
+      milestone: reached,
+      title: rankMap[reached] || `${reached}h`,
+    };
+  }
+
+  // Template FIXO que você pediu (trocando só o nome)
+  formatCallRoleName(hours, title) {
+    const baseName = title || `${hours}h`;
+    return `友𝅙𝅙﹒𝅙𝅙𑊑\`🪭\`ﾞ𝅙𝅙—ㅤ𝐃﹒${baseName}ㅤ﹑𝅙𝅙る`;
+  }
+
+  // Verifica se um cargo pertence ao sistema de horas em call (pelos nomes formatados)
+  isCallLevelRoleName(roleName) {
+    if (!roleName || typeof roleName !== 'string') return false;
+
+    const rankMap = this.getCallRankMap();
+    const allPossibleNames = Object.entries(rankMap).map(([hours, title]) =>
+      this.formatCallRoleName(Number(hours), title)
+    );
+
+    return allPossibleNames.includes(roleName);
+  }
+
+  // Descobre o milestone (horas) a partir do nome do cargo formatado
+  getCallLevelRoleHours(roleName) {
+    if (!roleName) return null;
+
+    const rankMap = this.getCallRankMap();
+    for (const [hours, title] of Object.entries(rankMap)) {
+      const expected = this.formatCallRoleName(Number(hours), title);
+      if (expected === roleName) return Number(hours);
+    }
+
+    return null;
+  }
+
+  // =========================
+  // CORES DOS CARGOS POR HORAS
+  // (por milestone)
+  // =========================
+  getCallLevelRoleColor(roleName) {
+    const hours = this.getCallLevelRoleHours(roleName);
+    if (!hours) return 0x99aab5; // fallback cinza
+
+    // Paleta visual por marcos
+    const colors = {
+      10: 0x7f8c8d,   // cinza
+      20: 0x3498db,   // azul
+      30: 0x5865f2,   // azul-roxo
+      40: 0x9b59b6,   // roxo
+      50: 0xe91e63,   // rosa
+      60: 0x8e44ad,   // roxo profundo
+      70: 0xc0392b,   // vermelho escuro
+      80: 0x2c3e50,   // azul escuro (véu)
+      90: 0x16a085,   // verde/teal
+      100: 0xf39c12,  // dourado
+      200: 0xd35400,  // laranja queimado
+      300: 0x8e44ad,  // roxo imperial
+      400: 0x2c3e50,  // grafite
+      500: 0xf1c40f,  // ouro
+      600: 0x1abc9c,  // turquesa
+      700: 0x34495e,  // sombra
+      800: 0xecf0f1,  // claro/escolhido
+      900: 0xe74c3c,  // vermelho supremo
+      1000: 0xffffff, // branco monarca
+    };
+
+    return colors[hours] || 0x99aab5;
+  }
+
+  async ensureCallLevelRole(guild, roleName) {
+    if (!guild || !roleName) return null;
+
+    const targetColor = this.getCallLevelRoleColor(roleName);
+    let role = guild.roles.cache.find(r => r.name === roleName);
+
+    // Se já existe, sincroniza a cor
+    if (role) {
+      try {
+        if (role.color !== targetColor) {
+          await role.edit({
+            color: targetColor,
+            reason: 'Sincronizando cor do cargo de horas em call'
+          });
+        }
+      } catch (err) {
+        console.error(`[CallRanking] Erro ao sincronizar cor do cargo ${roleName}:`, err);
+      }
+      return role;
+    }
+
+    try {
+      role = await guild.roles.create({
+        name: roleName,
+        color: targetColor,
+        reason: 'Sistema automático de cargos por horas em call',
+        mentionable: false,
+        hoist: false,
+      });
+
+      console.log(`[CallRanking] Cargo criado automaticamente: ${roleName}`);
+      return role;
+    } catch (err) {
+      console.error(`[CallRanking] Erro ao criar cargo ${roleName}:`, err);
+      return null;
+    }
+  }
+
+  async updateMemberCallLevelRole(guild, userId) {
+    if (!guild || !userId) return;
+
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (!member || member.user.bot) return;
+
+    const totalMs = this.getTotalWithLiveMs(userId);
+    const targetRoleData = this.getCallLevelRoleData(totalMs);
+
+    const currentCallRoles = member.roles.cache.filter(r => this.isCallLevelRoleName(r.name));
+
+    // Ainda não chegou em 10h -> remove cargos antigos de call (se tiver)
+    if (!targetRoleData) {
+      if (currentCallRoles.size > 0) {
+        await member.roles.remove(currentCallRoles).catch(err => {
+          console.error(`[CallRanking] Erro ao remover cargos de call de ${member.user.tag}:`, err);
+        });
+      }
+      return;
+    }
+
+    const targetRoleName = this.formatCallRoleName(targetRoleData.milestone, targetRoleData.title);
+    const targetRole = await this.ensureCallLevelRole(guild, targetRoleName);
+    if (!targetRole) return;
+
+    // Remove cargos antigos de call (exceto o atual)
+    const toRemove = currentCallRoles.filter(r => r.id !== targetRole.id);
+    if (toRemove.size > 0) {
+      await member.roles.remove(toRemove).catch(err => {
+        console.error(`[CallRanking] Erro ao remover cargos antigos de ${member.user.tag}:`, err);
+      });
+    }
+
+    // Adiciona cargo correto
+    if (!member.roles.cache.has(targetRole.id)) {
+      await member.roles.add(targetRole).catch(err => {
+        console.error(`[CallRanking] Erro ao adicionar cargo ${targetRoleName} para ${member.user.tag}:`, err);
+      });
+    }
+  }
+
+  async updateAllCallLevelRoles() {
+    if (!this.targetGuildId) return;
+
+    const guild = await this.client.guilds.fetch(this.targetGuildId).catch(() => null);
+    if (!guild) return;
+
+    const userIds = Object.keys(this.data.users || {});
+    for (const userId of userIds) {
+      await this.updateMemberCallLevelRole(guild, userId).catch(() => {});
+    }
+  }
+
+  // =========================
+  // VOICE TRACKING
+  // =========================
+  handleVoiceStateUpdate(oldState, newState) {
+    const member = newState.member || oldState.member;
+    if (!member || member.user.bot) return;
+
+    const guildId = newState.guild?.id || oldState.guild?.id;
+    const userId = member.id;
+    if (!guildId || !userId) return;
+
+    const wasInVoice = !!oldState.channelId;
+    const isInVoice = !!newState.channelId;
+
+    this.touchUser(member.user);
+
+    // entrou
+    if (!wasInVoice && isInVoice) {
+      this.startSession(guildId, userId);
+      this.save();
+      return;
+    }
+
+    // saiu
+    if (wasInVoice && !isInVoice) {
+      this.stopSession(guildId, userId);
+      return;
+    }
+
+    // trocou de canal / mudou estado (continua contando)
+    this.save();
+  }
+
+  // =========================
+  // EMBED
+  // =========================
+  buildEmbed(guild) {
+    const ranking = Object.keys(this.data.users)
+      .map(userId => ({
+        userId,
+        username: this.data.users[userId]?.username || `ID ${userId}`,
+        totalMs: this.getTotalWithLiveMs(userId),
+      }))
+      .sort((a, b) => b.totalMs - a.totalMs);
+
+    const top = ranking.slice(0, 15);
+
+    const lines = top.length
+      ? top.map((u, i) => {
+          const pos =
+            i === 0 ? '🥇' :
+            i === 1 ? '🥈' :
+            i === 2 ? '🥉' :
+            `\`${String(i + 1).padStart(2, '0')}\``;
+
+          return `${pos} <@${u.userId}> — **${this.formatMs(u.totalMs)}**`;
+        }).join('\n')
+      : 'Ninguém entrou em call ainda.';
+
+    const onlineNow = [...this.activeSessions.keys()]
+      .filter(k => k.startsWith(`${guild.id}:`)).length;
+
+    const lastUpdate = new Date().toLocaleString('pt-BR', {
+      timeZone: 'America/Sao_Paulo',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+
+    return new EmbedBuilder()
+      .setTitle('📞 Ranking de Horas em Call')
+      .setColor('#0099ff')
+      .setDescription([
+        '### 🏆 Top membros em call',
+        lines
+      ].join('\n\n'))
+      .addFields(
+        {
+          name: '👥 Em call agora',
+          value: `**${onlineNow}** membro(s)`,
+          inline: true
+        },
+        {
+          name: '🔄 Atualização',
+          value: 'A cada **5 minutos**',
+          inline: true
+        },
+        {
+          name: '🕒 Última atualização',
+          value: lastUpdate,
+          inline: false
+        }
+      )
+      .setFooter({ text: 'Desenvolvido por Lynn' })
+      .setTimestamp();
+  }
+
+  // =========================
+  // UPDATE MESSAGE
+  // =========================
+  async updateRankingMessage() {
+    if (!this.targetGuildId || !this.targetChannelId) {
+      console.warn('[CallRanking] IDs de guild/canal não configurados.');
+      return;
+    }
+
+    const guild = await this.client.guilds.fetch(this.targetGuildId).catch(() => null);
+    if (!guild) {
+      console.warn('[CallRanking] Servidor não encontrado:', this.targetGuildId);
+      return;
+    }
+
+    const channel = await guild.channels.fetch(this.targetChannelId).catch(() => null);
+    if (!channel || !channel.isTextBased?.()) {
+      console.warn('[CallRanking] Canal inválido:', this.targetChannelId);
+      return;
+    }
+
+    const embed = this.buildEmbed(guild);
+
+    let updatedOrSent = false;
+
+    if (this.data.rankingMessageId) {
+      const msg = await channel.messages.fetch(this.data.rankingMessageId).catch(() => null);
+      if (msg) {
+        await msg.edit({ embeds: [embed] }).catch(err => {
+          console.error('[CallRanking] Erro ao editar mensagem:', err);
+        });
+        updatedOrSent = true;
+      }
+    }
+
+    if (!updatedOrSent) {
+      const newMsg = await channel.send({ embeds: [embed] }).catch(err => {
+        console.error('[CallRanking] Erro ao enviar mensagem:', err);
+        return null;
+      });
+
+      if (newMsg) {
+        this.data.rankingMessageId = newMsg.id;
+        this.save();
+      }
+    }
+
+    // Sincroniza cargos automáticos após atualizar o ranking
+    await this.updateAllCallLevelRoles().catch(err => {
+      console.error('[CallRanking] Erro ao sincronizar cargos de nível:', err);
+    });
+  }
+
+  // =========================
+  // INIT
+  // =========================
+  async init() {
+    // captura membros já em call ao ligar o bot
+    for (const guild of this.client.guilds.cache.values()) {
+      for (const voiceState of guild.voiceStates.cache.values()) {
+        if (voiceState.channelId && voiceState.member && !voiceState.member.user.bot) {
+          this.touchUser(voiceState.member.user);
+          this.startSession(guild.id, voiceState.id);
+        }
+      }
+    }
+
+    this.save();
+
+    // Atualização inicial
+    await this.updateRankingMessage().catch(err => {
+      console.error('[CallRanking] Erro na atualização inicial:', err);
+    });
+
+    // Loop de atualização
     if (this.interval) clearInterval(this.interval);
 
     this.interval = setInterval(() => {
