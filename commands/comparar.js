@@ -228,23 +228,11 @@ module.exports = {
 
     try {
       const img = await createComparisonImage(name1, name2, s1, s2);
-      const attachment = new Attachment      ctx.font = 'bold 40px Minecraft';
-      ctx.textAlign = 'center';
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(name, centerX, 110);
-
-      ctx.font = 'bold 32px Minecraft';
-      ctx.fillStyle = '#ffaa00';
-      ctx.fillText(`NÍVEL ${level ?? 0}`, centerX, 145);
-
-      ctx.restore();
+      const attachment = new AttachmentBuilder(img, { name: 'comparar.png' });
+      return interaction.editReply({ embeds: [embed], files: [attachment] });
+    } catch (err) {
+      console.error('Erro ao gerar imagem de comparação:', err);
+      return interaction.editReply({ embeds: [embed] });
     }
-
-    drawPlayerInfo(player1, stats1.level || 0, skin1X, 'left');
-    drawPlayerInfo(player2, stats2.level || 0, skin2X, 'right');
-
-    // Métricas
-    metrics.forEach(([label, getValue], i) => {
-      if (typeof getValue !== 'function') return;
-
-      const y = 220 + (i * 55)*
+  },
+};
