@@ -77,7 +77,7 @@ class CallRankingManager {
   save() {
     this.ensureStorage();
 
-    // 1) cria backup do arquivo atual (antes de sobrescrever)
+    // cria backup do arquivo atual antes de sobrescrever
     try {
       if (fs.existsSync(this.filePath)) {
         fs.copyFileSync(this.filePath, this.backupPath);
@@ -86,7 +86,6 @@ class CallRankingManager {
       console.warn('[CallRanking] Falha ao criar backup:', err?.message || err);
     }
 
-    // 2) salva o arquivo principal
     fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
   }
 
@@ -145,6 +144,12 @@ class CallRankingManager {
 
     this.data.users[userId].totalMs += Math.max(0, elapsed);
     this.save();
+
+    // Atualiza cargo de nível ao sair da call (ganha cargo imediatamente)
+    if (this.targetGuildId && String(guildId) === String(this.targetGuildId)) {
+      const guild = this.client.guilds.cache.get(guildId) || null;
+      this.updateMemberCallLevelRole(guild, userId).catch(() => {});
+    }
   }
 
   getLiveMs(userId) {
@@ -163,6 +168,119 @@ class CallRankingManager {
   getTotalWithLiveMs(userId) {
     const base = this.data.users[userId]?.totalMs || 0;
     return base + this.getLiveMs(userId);
+  }
+
+  // =========================
+  // CARGOS POR HORAS EM CALL
+  // =========================
+  getCallHours(totalMs) {
+    return Number(totalMs || 0) / 3600000;
+  }
+
+  // Regras:
+  // 10h, 20h, ..., 100h
+  // depois 200h, 300h, 400h...
+  getCallLevelRoleName(totalMs) {
+    const hours = this.getCallHours(totalMs);
+
+    if (hours < 10) return null;
+
+    if (hours <= 100) {
+      const step = Math.floor(hours / 10) * 10;
+      return `${step}h`;
+    }
+
+    const step = Math.floor(hours / 100) * 100;
+    return `${step}h`;
+  }
+
+  isCallLevelRoleName(roleName) {
+    if (!roleName || typeof roleName !== 'string') return false;
+
+    // 10h..100h
+    if (/^(10|20|30|40|50|60|70|80|90|100)h$/.test(roleName)) return true;
+
+    // 200h, 300h, 400h...
+    if (/^[1-9]\d{2,}h$/.test(roleName)) {
+      const n = parseInt(roleName.replace('h', ''), 10);
+      return n >= 200 && n % 100 === 0;
+    }
+
+    return false;
+  }
+
+  async ensureCallLevelRole(guild, roleName) {
+    if (!guild || !roleName) return null;
+
+    let role = guild.roles.cache.find(r => r.name === roleName);
+    if (role) return role;
+
+    try {
+      role = await guild.roles.create({
+        name: roleName,
+        reason: 'Sistema automático de cargos por horas em call',
+        mentionable: false,
+        hoist: false,
+      });
+
+      console.log(`[CallRanking] Cargo criado automaticamente: ${roleName}`);
+      return role;
+    } catch (err) {
+      console.error(`[CallRanking] Erro ao criar cargo ${roleName}:`, err);
+      return null;
+    }
+  }
+
+  async updateMemberCallLevelRole(guild, userId) {
+    if (!guild || !userId) return;
+
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (!member || member.user.bot) return;
+
+    const totalMs = this.getTotalWithLiveMs(userId);
+    const targetRoleName = this.getCallLevelRoleName(totalMs);
+
+    const currentCallRoles = member.roles.cache.filter(r => this.isCallLevelRoleName(r.name));
+
+    // Se ainda não chegou em 10h, remove cargos de call antigos
+    if (!targetRoleName) {
+      if (currentCallRoles.size > 0) {
+        await member.roles.remove(currentCallRoles).catch(err => {
+          console.error(`[CallRanking] Erro ao remover cargos de call de ${member.user.tag}:`, err);
+        });
+      }
+      return;
+    }
+
+    const targetRole = await this.ensureCallLevelRole(guild, targetRoleName);
+    if (!targetRole) return;
+
+    // remove cargos antigos (menos o atual)
+    const toRemove = currentCallRoles.filter(r => r.id !== targetRole.id);
+    if (toRemove.size > 0) {
+      await member.roles.remove(toRemove).catch(err => {
+        console.error(`[CallRanking] Erro ao remover cargos antigos de ${member.user.tag}:`, err);
+      });
+    }
+
+    // adiciona o cargo correto
+    if (!member.roles.cache.has(targetRole.id)) {
+      await member.roles.add(targetRole).catch(err => {
+        console.error(`[CallRanking] Erro ao adicionar cargo ${targetRoleName} para ${member.user.tag}:`, err);
+      });
+    }
+  }
+
+  async updateAllCallLevelRoles() {
+    if (!this.targetGuildId) return;
+
+    const guild = await this.client.guilds.fetch(this.targetGuildId).catch(() => null);
+    if (!guild) return;
+
+    const userIds = Object.keys(this.data.users || {});
+    for (const userId of userIds) {
+      await this.updateMemberCallLevelRole(guild, userId).catch(() => {});
+    }
   }
 
   // =========================
@@ -287,25 +405,34 @@ class CallRankingManager {
 
     const embed = this.buildEmbed(guild);
 
+    let updatedOrSent = false;
+
     if (this.data.rankingMessageId) {
       const msg = await channel.messages.fetch(this.data.rankingMessageId).catch(() => null);
       if (msg) {
         await msg.edit({ embeds: [embed] }).catch(err => {
           console.error('[CallRanking] Erro ao editar mensagem:', err);
         });
-        return;
+        updatedOrSent = true;
       }
     }
 
-    const newMsg = await channel.send({ embeds: [embed] }).catch(err => {
-      console.error('[CallRanking] Erro ao enviar mensagem:', err);
-      return null;
-    });
+    if (!updatedOrSent) {
+      const newMsg = await channel.send({ embeds: [embed] }).catch(err => {
+        console.error('[CallRanking] Erro ao enviar mensagem:', err);
+        return null;
+      });
 
-    if (newMsg) {
-      this.data.rankingMessageId = newMsg.id;
-      this.save();
+      if (newMsg) {
+        this.data.rankingMessageId = newMsg.id;
+        this.save();
+      }
     }
+
+    // sincroniza cargos por horas em call
+    await this.updateAllCallLevelRoles().catch(err => {
+      console.error('[CallRanking] Erro ao sincronizar cargos de nível:', err);
+    });
   }
 
   // =========================
