@@ -18,8 +18,8 @@ const CallRankingManager = require('./managers/CallRankingManager');
 // CONFIG
 // =====================
 const TOKEN = process.env.BOT_TOKEN || process.env.DISCORD_TOKEN;
-const AUTO_VOICE_CHANNEL_ID = '1476401616784724030'; // ✅ call fixa
-const AUTO_VOICE_REJOIN_DELAY_MS = 5000; // 5s
+const AUTO_VOICE_CHANNEL_ID = '1476401616784724030'; // call fixa
+const AUTO_VOICE_REJOIN_DELAY_MS = 5000;
 let autoVoiceReconnectTimeout = null;
 
 if (!TOKEN) {
@@ -36,7 +36,7 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates, // ✅ necessário pro ranking + voz
+    GatewayIntentBits.GuildVoiceStates,
   ],
   shards: 'auto',
   failIfNotExists: false,
@@ -79,14 +79,14 @@ function startLynnPresence(clientInstance) {
   };
 
   applyPresence();
-  setInterval(applyPresence, 60_000); // troca a cada 1 minuto
+  setInterval(applyPresence, 60_000);
 }
 
 // =====================
 // AUTO JOIN / REJOIN VOICE
 // =====================
 function scheduleAutoRejoinVoice(clientInstance, reason = 'desconectada') {
-  if (autoVoiceReconnectTimeout) return; // evita spam
+  if (autoVoiceReconnectTimeout) return;
 
   console.log(`ℹ️ Lynn Bot saiu da call alvo (${reason}). Tentando voltar em ${AUTO_VOICE_REJOIN_DELAY_MS / 1000}s...`);
 
@@ -102,7 +102,7 @@ async function autoJoinSpecificVoiceChannel(clientInstance) {
 
     let voiceChannel = null;
 
-    // 1) procura no cache
+    // cache
     for (const guild of clientInstance.guilds.cache.values()) {
       const ch = guild.channels.cache.get(AUTO_VOICE_CHANNEL_ID);
       if (ch) {
@@ -111,7 +111,7 @@ async function autoJoinSpecificVoiceChannel(clientInstance) {
       }
     }
 
-    // 2) fallback: fetch em cada guild
+    // fetch fallback
     if (!voiceChannel) {
       for (const guild of clientInstance.guilds.cache.values()) {
         const ch = await guild.channels.fetch(AUTO_VOICE_CHANNEL_ID).catch(() => null);
@@ -132,20 +132,28 @@ async function autoJoinSpecificVoiceChannel(clientInstance) {
       return;
     }
 
-    // Se já existe conexão na guild, não duplica
     const existing = getVoiceConnection(voiceChannel.guild.id);
     if (existing) {
-      // se já estiver no canal alvo, ok
       const currentJoinConfig = existing.joinConfig || {};
+
       if (currentJoinConfig.channelId === AUTO_VOICE_CHANNEL_ID) {
         console.log(`ℹ️ Lynn Bot já está conectada na call alvo (${AUTO_VOICE_CHANNEL_ID}).`);
+
+        // ✅ garante sessão no ranking mesmo se já estava conectada
+        try {
+          if (clientInstance.callRanking && clientInstance.user) {
+            await clientInstance.callRanking.touchUser(clientInstance.user);
+            await clientInstance.callRanking.startSession(voiceChannel.guild.id, clientInstance.user.id);
+            console.log('✅ Sessão da Lynn Bot registrada no CallRanking (conexão já existente).');
+          }
+        } catch (e) {
+          console.error('❌ Erro ao registrar Lynn Bot no CallRanking (conexão existente):', e);
+        }
+
         return;
       }
 
-      // se está em outro canal, destrói e recria na call alvo
-      try {
-        existing.destroy();
-      } catch {}
+      try { existing.destroy(); } catch {}
     }
 
     const connection = joinVoiceChannel({
@@ -158,10 +166,20 @@ async function autoJoinSpecificVoiceChannel(clientInstance) {
 
     await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
 
-    // Observa desconexões e agenda retorno
+    // ✅ Garante contagem da Lynn Bot no ranking
+    try {
+      if (clientInstance.callRanking && clientInstance.user) {
+        await clientInstance.callRanking.touchUser(clientInstance.user);
+        await clientInstance.callRanking.startSession(voiceChannel.guild.id, clientInstance.user.id);
+        console.log('✅ Sessão da Lynn Bot registrada no CallRanking.');
+      }
+    } catch (e) {
+      console.error('❌ Erro ao registrar Lynn Bot no CallRanking:', e);
+    }
+
+    // Observa desconexão e agenda retorno
     connection.on('stateChange', (_oldState, newState) => {
       const status = newState?.status;
-
       if (
         status === VoiceConnectionStatus.Disconnected ||
         status === VoiceConnectionStatus.Destroyed
@@ -213,7 +231,6 @@ for (const file of commandFiles) {
     continue;
   }
 
-  // Compatibilidade com comandos em objeto simples
   if (typeof command.data === 'object' && typeof command.data.toJSON !== 'function') {
     const { name, description, options = [] } = command.data;
     command.data = {
@@ -284,13 +301,10 @@ const rest = new REST({ version: '9' }).setToken(TOKEN);
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot iniciado como ${client.user.tag}`);
 
-  // Atividades da Lynn Bot
+  // presença
   startLynnPresence(client);
 
-  // Entrar automaticamente na call específica
-  await autoJoinSpecificVoiceChannel(client);
-
-  // Registra slash commands (globais)
+  // slash commands
   try {
     await rest.put(
       Routes.applicationCommands(client.user.id),
@@ -303,7 +317,7 @@ client.once(Events.ClientReady, async () => {
 
   client.ownerId = '1283948475742031912';
 
-  // Inicializa sistemas
+  // ✅ ORDEM IMPORTANTE: inicia ranking primeiro, depois entra na call
   try {
     await client.licenses.init();
     console.log('✅ Sistema de licenças inicializado');
@@ -311,11 +325,13 @@ client.once(Events.ClientReady, async () => {
     await client.players.init();
     await client.clans.init();
 
-    // Se seu sistema usa essa reinstância
     client.recruitmentManager = new RecruitmentManager(client);
 
     await client.callRanking.init();
     console.log('✅ Ranking de call inicializado');
+
+    // ✅ entra na call depois do ranking estar pronto
+    await autoJoinSpecificVoiceChannel(client);
 
     console.log('✅ Todos os sistemas inicializados com sucesso');
   } catch (error) {
@@ -324,11 +340,10 @@ client.once(Events.ClientReady, async () => {
 });
 
 // =====================
-// INTERAÇÕES (slash / botão / modal)
+// INTERAÇÕES
 // =====================
 client.on('interactionCreate', async (interaction) => {
   try {
-    // Slash commands
     if (interaction.isCommand()) {
       const command = client.commands.get(interaction.commandName);
       if (!command) return;
@@ -356,7 +371,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // Botões
     if (interaction.isButton()) {
       const id = interaction.customId;
 
@@ -376,7 +390,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // Modais
     if (interaction.isModalSubmit()) {
       if (interaction.customId.startsWith('paineledit_')) {
         const parts = interaction.customId.split('_');
@@ -434,19 +447,28 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 // =====================
-// AUTO-REJOIN DA LYNN BOT NA CALL ALVO
+// AUTO-REJOIN DA LYNN BOT
 // =====================
 client.on('voiceStateUpdate', async (oldState, newState) => {
   try {
-    // reage apenas à própria Lynn Bot
     if (!client.user) return;
     if (newState.id !== client.user.id) return;
 
     const oldChannelId = oldState.channelId;
     const newChannelId = newState.channelId;
 
-    // saiu da call alvo (desconectada ou movida)
+    // saiu da call alvo
     if (oldChannelId === AUTO_VOICE_CHANNEL_ID && newChannelId !== AUTO_VOICE_CHANNEL_ID) {
+      // encerra sessão atual da Lynn no ranking
+      try {
+        if (client.callRanking && client.user) {
+          await client.callRanking.stopSession(oldState.guild.id, client.user.id);
+          console.log('ℹ️ Sessão da Lynn Bot encerrada no CallRanking (saiu da call alvo).');
+        }
+      } catch (e) {
+        console.error('Erro ao encerrar sessão da Lynn Bot no CallRanking:', e);
+      }
+
       scheduleAutoRejoinVoice(client, 'foi removida/movida');
       return;
     }
