@@ -510,7 +510,7 @@ client.ws.on('error', (error) => {
 client.login(TOKEN).catch((err) => {
   console.error('❌ Falha ao logar no Discord:', err);
   process.exit(1);
-});      }
+});      
     }
 
     // fetch fallback
