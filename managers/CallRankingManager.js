@@ -120,6 +120,11 @@ class CallRankingManager {
     }
   }
 
+  // ✅ MÉTODO QUE ESTAVA FALTANDO
+  async loadMeta() {
+    this.cache.rankingMessageId = await this.getMeta('rankingMessageId');
+  }
+
   // =========================
   // AUTO-IMPORT JSON -> SQLITE (1ª vez)
   // =========================
@@ -601,7 +606,7 @@ class CallRankingManager {
     await this.openDb();
     await this.initDbSchema();
     await this.autoImportLegacyJsonIfNeeded();
-    await this.loadMeta();
+    await this.loadMeta(); // ✅ agora existe
     await this.restoreActiveSessionsFromDb();
 
     // Captura membros já em call ao ligar
