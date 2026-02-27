@@ -12,11 +12,10 @@ class CallRankingManager {
     this.legacyJsonPath = path.join(this.dataDir, 'call_ranking.json');
     this.legacyBackupJsonPath = path.join(this.dataDir, 'call_ranking.backup.json');
 
-    this.activeSessions = new Map(); // guildId:userId => timestamp (memória)
+    this.activeSessions = new Map(); // guildId:userId => startedAt
     this.interval = null;
     this.updateIntervalMs = 5 * 60 * 1000; // 5 min
 
-    // snapshots periódicos (export JSON)
     this.snapshotBackupIntervalMs = 10 * 60 * 60 * 1000; // 10h
     this.snapshotInterval = null;
     this.lastSnapshotAt = 0;
@@ -31,7 +30,7 @@ class CallRankingManager {
   }
 
   // =========================
-  // FS / DB BASE
+  // FS / DB
   // =========================
   ensureStorage() {
     if (!fs.existsSync(this.dataDir)) {
@@ -125,6 +124,21 @@ class CallRankingManager {
   }
 
   // =========================
+  // TRACK RULES (permite Lynn Bot)
+  // =========================
+  isTrackableUser(user) {
+    if (!user) return false;
+
+    // ✅ Permite a própria Lynn Bot
+    if (this.client?.user && user.id === this.client.user.id) return true;
+
+    // ❌ Ignora outros bots
+    if (user.bot) return false;
+
+    return true;
+  }
+
+  // =========================
   // AUTO-IMPORT JSON -> SQLITE (1ª vez)
   // =========================
   readLegacyJsonSafe(filePath) {
@@ -132,9 +146,11 @@ class CallRankingManager {
       if (!fs.existsSync(filePath)) return null;
       const raw = fs.readFileSync(filePath, 'utf8');
       const json = JSON.parse(raw);
+
       if (!json || typeof json !== 'object') return null;
       if (!json.users || typeof json.users !== 'object') json.users = {};
       if (!('rankingMessageId' in json)) json.rankingMessageId = null;
+
       return json;
     } catch (err) {
       console.warn(`[CallRanking] Falha ao ler JSON legado (${path.basename(filePath)}):`, err?.message || err);
@@ -149,7 +165,7 @@ class CallRankingManager {
 
   async autoImportLegacyJsonIfNeeded() {
     const dbUserCount = await this.countUsersInDb();
-    if (dbUserCount > 0) return; // banco já tem dados
+    if (dbUserCount > 0) return;
 
     const legacy =
       this.readLegacyJsonSafe(this.legacyJsonPath) ||
@@ -160,8 +176,7 @@ class CallRankingManager {
       return;
     }
 
-    const users = legacy.users || {};
-    const entries = Object.entries(users);
+    const entries = Object.entries(legacy.users || {});
 
     if (entries.length === 0 && !legacy.rankingMessageId) {
       console.log('[CallRanking] JSON legado vazio, nada para importar.');
@@ -189,7 +204,7 @@ class CallRankingManager {
   }
 
   // =========================
-  // SNAPSHOT JSON (backup/export)
+  // SNAPSHOTS / BACKUP
   // =========================
   async exportCurrentDataAsJsonObject() {
     const usersRows = await this.all(`SELECT user_id, username, total_ms FROM call_users`);
@@ -219,9 +234,10 @@ class CallRankingManager {
 
       const json = await this.exportCurrentDataAsJsonObject();
       fs.writeFileSync(snapshotPath, JSON.stringify(json, null, 2));
-      this.lastSnapshotAt = Date.now();
 
+      this.lastSnapshotAt = Date.now();
       console.log(`[CallRanking] Snapshot criado: ${filename}`);
+
       this.cleanupOldSnapshots(10);
     } catch (err) {
       console.error('[CallRanking] Erro ao criar snapshot backup:', err);
@@ -248,7 +264,6 @@ class CallRankingManager {
     }
   }
 
-  // Helper para comando manual de backup (DM / canal)
   async createManualBackupPayload() {
     const data = await this.exportCurrentDataAsJsonObject();
     const now = new Date();
@@ -270,7 +285,7 @@ class CallRankingManager {
     return `${guildId}:${userId}`;
   }
 
-  // ✅ AGORA MOSTRA SOMENTE HORAS E MINUTOS (sem converter para dias)
+  // ✅ sem converter pra dias
   formatMs(ms) {
     const totalMinutes = Math.floor((Number(ms) || 0) / 1000 / 60);
     const hours = Math.floor(totalMinutes / 60);
@@ -281,7 +296,7 @@ class CallRankingManager {
   }
 
   async touchUser(user) {
-    if (!user || user.bot) return;
+    if (!this.isTrackableUser(user)) return;
 
     await this.run(
       `INSERT INTO call_users (user_id, username, total_ms)
@@ -298,10 +313,14 @@ class CallRankingManager {
 
   getLiveMs(userId) {
     let total = 0;
+
     for (const [k, startedAt] of this.activeSessions.entries()) {
       const [, uid] = k.split(':');
-      if (uid === String(userId)) total += (Date.now() - startedAt);
+      if (uid === String(userId)) {
+        total += (Date.now() - startedAt);
+      }
     }
+
     return total;
   }
 
@@ -310,7 +329,7 @@ class CallRankingManager {
   }
 
   // =========================
-  // RANK MAP (dark anime)
+  // CARGOS POR HORAS (dark anime)
   // =========================
   getCallRankMap() {
     return {
@@ -348,6 +367,7 @@ class CallRankingManager {
       if (hours >= h) reached = h;
       else break;
     }
+
     if (!reached) return null;
 
     return {
@@ -363,6 +383,7 @@ class CallRankingManager {
 
   isCallLevelRoleName(roleName) {
     if (!roleName) return false;
+
     const rankMap = this.getCallRankMap();
     return Object.entries(rankMap).some(([h, title]) =>
       this.formatCallRoleName(Number(h), title) === roleName
@@ -376,6 +397,7 @@ class CallRankingManager {
       200: 0xd35400, 300: 0x8e44ad, 400: 0x2c3e50, 500: 0xf1c40f, 600: 0x1abc9c,
       700: 0x34495e, 800: 0xecf0f1, 900: 0xe74c3c, 1000: 0xffffff
     };
+
     return map[hours] || 0x99aab5;
   }
 
@@ -399,7 +421,9 @@ class CallRankingManager {
 
   async updateMemberCallLevelRole(guild, userId) {
     const member = await guild.members.fetch(userId).catch(() => null);
-    if (!member || member.user.bot) return;
+
+    // ✅ Lynn Bot pode contar; outros bots não
+    if (!member || !this.isTrackableUser(member.user)) return;
 
     const totalMs = await this.getTotalWithLiveMs(userId);
     const hours = totalMs / 3600000;
@@ -435,6 +459,7 @@ class CallRankingManager {
     if (!guild) return;
 
     const rows = await this.all(`SELECT user_id FROM call_users`);
+
     for (const row of rows) {
       try {
         await this.updateMemberCallLevelRole(guild, row.user_id);
@@ -445,7 +470,7 @@ class CallRankingManager {
   }
 
   // =========================
-  // SESSÕES DE CALL (persistidas)
+  // SESSÕES DE CALL
   // =========================
   async startSession(guildId, userId) {
     const k = this.key(guildId, userId);
@@ -468,6 +493,7 @@ class CallRankingManager {
     if (!startedAt) return;
 
     this.activeSessions.delete(k);
+
     const elapsed = Math.max(0, Date.now() - startedAt);
 
     const existing = await this.get(`SELECT username FROM call_users WHERE user_id = ?`, [String(userId)]);
@@ -492,7 +518,9 @@ class CallRankingManager {
 
   async handleVoiceStateUpdate(oldState, newState) {
     const member = newState.member || oldState.member;
-    if (!member || member.user.bot) return;
+
+    // ✅ Lynn Bot conta; outros bots não
+    if (!member || !this.isTrackableUser(member.user)) return;
 
     const guildId = newState.guild?.id || oldState.guild?.id;
     const userId = member.id;
@@ -513,7 +541,7 @@ class CallRankingManager {
       return;
     }
 
-    // trocou de canal ou mudou estado -> mantém sessão sem reset
+    // troca de canal / mute / deaf etc. -> mantém sessão sem reset
   }
 
   // =========================
@@ -522,11 +550,12 @@ class CallRankingManager {
   async buildEmbed(guild) {
     const rows = await this.all(`SELECT user_id, total_ms FROM call_users`);
 
-    const ranking = rows.map(row => ({
-      userId: row.user_id,
-      totalMs: Number(row.total_ms || 0) + this.getLiveMs(row.user_id),
-    }))
-    .sort((a, b) => b.totalMs - a.totalMs);
+    const ranking = rows
+      .map(row => ({
+        userId: row.user_id,
+        totalMs: Number(row.total_ms || 0) + this.getLiveMs(row.user_id),
+      }))
+      .sort((a, b) => b.totalMs - a.totalMs);
 
     const top = ranking.slice(0, 15);
 
@@ -618,10 +647,10 @@ class CallRankingManager {
     await this.loadMeta();
     await this.restoreActiveSessionsFromDb();
 
-    // Captura membros já em call ao ligar
+    // captura membros já em call ao ligar (inclui Lynn Bot)
     for (const guild of this.client.guilds.cache.values()) {
       for (const voiceState of guild.voiceStates.cache.values()) {
-        if (voiceState.channelId && voiceState.member && !voiceState.member.user.bot) {
+        if (voiceState.channelId && voiceState.member && this.isTrackableUser(voiceState.member.user)) {
           await this.touchUser(voiceState.member.user);
 
           const k = this.key(guild.id, voiceState.id);
@@ -647,9 +676,4 @@ class CallRankingManager {
 
     if (this.snapshotInterval) clearInterval(this.snapshotInterval);
     this.snapshotInterval = setInterval(() => {
-      this.createSnapshotBackup().catch?.(() => {});
-    }, this.snapshotBackupIntervalMs);
-  }
-}
-
-module.exports = CallRankingManager;
+      this.createSnapshotBackup()
