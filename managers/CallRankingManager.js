@@ -13,6 +13,11 @@ class CallRankingManager {
     this.updateIntervalMs = 5 * 60 * 1000;
     this.interval = null;
 
+    // ✅ backups periódicos (snapshot)
+    this.snapshotBackupIntervalMs = 10 * 60 * 60 * 1000; // 10 horas
+    this.snapshotInterval = null;
+    this.lastSnapshotAt = 0;
+
     this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || null;
     this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null;
 
@@ -63,6 +68,50 @@ class CallRankingManager {
     }
 
     fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+  }
+
+  // ✅ Snapshot backup (arquivo separado) a cada ~10h
+  createSnapshotBackup() {
+    this.ensureStorage();
+
+    try {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+
+      const filename = `call_ranking.snapshot.${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
+      const snapshotPath = path.join(this.dataDir, filename);
+
+      fs.writeFileSync(snapshotPath, JSON.stringify(this.data, null, 2));
+      this.lastSnapshotAt = Date.now();
+
+      console.log(`[CallRanking] Snapshot criado: ${filename}`);
+
+      // mantém só os últimos 10 snapshots
+      this.cleanupOldSnapshots(10);
+    } catch (err) {
+      console.error('[CallRanking] Erro ao criar snapshot backup:', err);
+    }
+  }
+
+  cleanupOldSnapshots(keep = 10) {
+    try {
+      const files = fs.readdirSync(this.dataDir)
+        .filter(name => name.startsWith('call_ranking.snapshot.') && name.endsWith('.json'))
+        .map(name => ({
+          name,
+          fullPath: path.join(this.dataDir, name),
+          mtime: fs.statSync(path.join(this.dataDir, name)).mtimeMs
+        }))
+        .sort((a, b) => b.mtime - a.mtime); // mais novo primeiro
+
+      const toDelete = files.slice(keep);
+      for (const file of toDelete) {
+        fs.unlinkSync(file.fullPath);
+        console.log(`[CallRanking] Snapshot antigo removido: ${file.name}`);
+      }
+    } catch (err) {
+      console.warn('[CallRanking] Falha ao limpar snapshots antigos:', err?.message || err);
+    }
   }
 
   key(guildId, userId) {
@@ -363,12 +412,21 @@ class CallRankingManager {
       console.error('[CallRanking] Erro na atualização inicial:', err);
     });
 
+    // ✅ snapshot inicial
+    this.createSnapshotBackup();
+
     if (this.interval) clearInterval(this.interval);
     this.interval = setInterval(() => {
       this.updateRankingMessage().catch(err => {
         console.error('[CallRanking] Erro na atualização periódica:', err);
       });
     }, this.updateIntervalMs);
+
+    // ✅ snapshots periódicos (~10h)
+    if (this.snapshotInterval) clearInterval(this.snapshotInterval);
+    this.snapshotInterval = setInterval(() => {
+      this.createSnapshotBackup();
+    }, this.snapshotBackupIntervalMs);
   }
 }
 
