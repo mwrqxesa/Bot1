@@ -120,7 +120,6 @@ class CallRankingManager {
     }
   }
 
-  // ✅ MÉTODO QUE ESTAVA FALTANDO
   async loadMeta() {
     this.cache.rankingMessageId = await this.getMeta('rankingMessageId');
   }
@@ -152,7 +151,6 @@ class CallRankingManager {
     const dbUserCount = await this.countUsersInDb();
     if (dbUserCount > 0) return; // banco já tem dados
 
-    // tenta principal e depois backup
     const legacy =
       this.readLegacyJsonSafe(this.legacyJsonPath) ||
       this.readLegacyJsonSafe(this.legacyBackupJsonPath);
@@ -187,7 +185,6 @@ class CallRankingManager {
     }
 
     await this.setMeta('legacyJsonImportedAt', String(Date.now()));
-
     console.log(`[CallRanking] Importação automática concluída: ${entries.length} usuário(s) do JSON legado.`);
   }
 
@@ -225,7 +222,6 @@ class CallRankingManager {
       this.lastSnapshotAt = Date.now();
 
       console.log(`[CallRanking] Snapshot criado: ${filename}`);
-
       this.cleanupOldSnapshots(10);
     } catch (err) {
       console.error('[CallRanking] Erro ao criar snapshot backup:', err);
@@ -252,6 +248,21 @@ class CallRankingManager {
     }
   }
 
+  // Helper para comando manual de backup (DM / canal)
+  async createManualBackupPayload() {
+    const data = await this.exportCurrentDataAsJsonObject();
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+
+    const fileName = `call_ranking_backup_${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
+
+    return {
+      fileName,
+      buffer: Buffer.from(JSON.stringify(data, null, 2), 'utf8'),
+      data,
+    };
+  }
+
   // =========================
   // HELPERS
   // =========================
@@ -259,15 +270,14 @@ class CallRankingManager {
     return `${guildId}:${userId}`;
   }
 
+  // ✅ AGORA MOSTRA SOMENTE HORAS E MINUTOS (sem converter para dias)
   formatMs(ms) {
-    const sec = Math.floor((Number(ms) || 0) / 1000);
-    const d = Math.floor(sec / 86400);
-    const h = Math.floor((sec % 86400) / 3600);
-    const m = Math.floor((sec % 3600) / 60);
+    const totalMinutes = Math.floor((Number(ms) || 0) / 1000 / 60);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
 
-    if (d > 0) return `${d}d ${h}h ${m}m`;
-    if (h > 0) return `${h}h ${m}m`;
-    return `${m}m`;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
   }
 
   async touchUser(user) {
@@ -460,7 +470,6 @@ class CallRankingManager {
     this.activeSessions.delete(k);
     const elapsed = Math.max(0, Date.now() - startedAt);
 
-    // soma no total_ms preservando username atual se existir
     const existing = await this.get(`SELECT username FROM call_users WHERE user_id = ?`, [String(userId)]);
     const username = existing?.username || `ID ${userId}`;
 
@@ -606,7 +615,7 @@ class CallRankingManager {
     await this.openDb();
     await this.initDbSchema();
     await this.autoImportLegacyJsonIfNeeded();
-    await this.loadMeta(); // ✅ agora existe
+    await this.loadMeta();
     await this.restoreActiveSessionsFromDb();
 
     // Captura membros já em call ao ligar
