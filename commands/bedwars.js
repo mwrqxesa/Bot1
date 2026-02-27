@@ -1,10 +1,216 @@
-const { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
+const {
+  SlashCommandBuilder,
+  EmbedBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+} = require('discord.js');
 const axios = require('axios');
+
+const MUSH_API = 'https://mush.com.br/api/player';
+
+function n(v) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : 0;
+}
+
+function fmt(v) {
+  return n(v).toLocaleString('pt-BR');
+}
+
+function ratio(a, b) {
+  a = n(a);
+  b = n(b);
+  if (b <= 0) return '0.00';
+  return (a / b).toFixed(2);
+}
+
+function getWinPercent(wins, games) {
+  wins = n(wins);
+  games = n(games);
+  if (games <= 0) return '0.00';
+  return ((wins / games) * 100).toFixed(2);
+}
+
+function modeLabel(mode) {
+  switch (mode) {
+    case 'solo': return 'Solo';
+    case 'dupla': return 'Dupla';
+    case 'trio': return 'Trio';
+    case 'quarteto': return 'Quarteto';
+    default: return 'Geral';
+  }
+}
+
+function getModeStats(bedwarsStats, mode) {
+  if (!bedwarsStats) return null;
+
+  if (mode === 'geral') {
+    return {
+      beds_broken: n(bedwarsStats.beds_broken),
+      beds_lost: n(bedwarsStats.beds_lost),
+      kills: n(bedwarsStats.kills),
+      deaths: n(bedwarsStats.deaths),
+      assists: n(bedwarsStats.assists),
+      final_kills: n(bedwarsStats.final_kills),
+      final_deaths: n(bedwarsStats.final_deaths),
+      final_assists: n(bedwarsStats.final_assists),
+      wins: n(bedwarsStats.wins),
+      losses: n(bedwarsStats.losses),
+      games_played: n(bedwarsStats.games_played),
+      winstreak: n(bedwarsStats.winstreak),
+      max_winstreak: n(bedwarsStats.max_winstreak),
+    };
+  }
+
+  if (mode === 'solo') {
+    return {
+      beds_broken: n(bedwarsStats.solo_beds_broken),
+      beds_lost: n(bedwarsStats.solo_beds_lost),
+      kills: n(bedwarsStats.solo_kills),
+      deaths: n(bedwarsStats.solo_deaths),
+      assists: n(bedwarsStats.solo_assists),
+      final_kills: n(bedwarsStats.solo_final_kills),
+      final_deaths: n(bedwarsStats.solo_final_deaths),
+      final_assists: n(bedwarsStats.solo_final_assists),
+      wins: n(bedwarsStats.solo_wins),
+      losses: n(bedwarsStats.solo_losses),
+      games_played: n(bedwarsStats.solo_games_played),
+      winstreak: n(bedwarsStats.solo_winstreak),
+      max_winstreak: n(bedwarsStats.solo_max_winstreak),
+    };
+  }
+
+  if (mode === 'dupla') {
+    return {
+      beds_broken: n(bedwarsStats.doubles_beds_broken),
+      beds_lost: n(bedwarsStats.doubles_beds_lost),
+      kills: n(bedwarsStats.doubles_kills),
+      deaths: n(bedwarsStats.doubles_deaths),
+      assists: n(bedwarsStats.doubles_assists),
+      final_kills: n(bedwarsStats.doubles_final_kills),
+      final_deaths: n(bedwarsStats.doubles_final_deaths),
+      final_assists: n(bedwarsStats.doubles_final_assists),
+      wins: n(bedwarsStats.doubles_wins),
+      losses: n(bedwarsStats.doubles_losses),
+      games_played: n(bedwarsStats.doubles_games_played),
+      winstreak: n(bedwarsStats.doubles_winstreak),
+      max_winstreak: n(bedwarsStats.doubles_max_winstreak),
+    };
+  }
+
+  if (mode === 'trio') {
+    return {
+      beds_broken: n(bedwarsStats['3v3v3v3_beds_broken']),
+      beds_lost: n(bedwarsStats['3v3v3v3_beds_lost']),
+      kills: n(bedwarsStats['3v3v3v3_kills']),
+      deaths: n(bedwarsStats['3v3v3v3_deaths']),
+      assists: n(bedwarsStats['3v3v3v3_assists']),
+      final_kills: n(bedwarsStats['3v3v3v3_final_kills']),
+      final_deaths: n(bedwarsStats['3v3v3v3_final_deaths']),
+      final_assists: n(bedwarsStats['3v3v3v3_final_assists']),
+      wins: n(bedwarsStats['3v3v3v3_wins']),
+      losses: n(bedwarsStats['3v3v3v3_losses']),
+      games_played: n(bedwarsStats['3v3v3v3_games_played']),
+      winstreak: n(bedwarsStats['3v3v3v3_winstreak']),
+      max_winstreak: n(bedwarsStats['3v3v3v3_max_winstreak']),
+    };
+  }
+
+  if (mode === 'quarteto') {
+    return {
+      beds_broken: n(bedwarsStats['4v4v4v4_beds_broken']),
+      beds_lost: n(bedwarsStats['4v4v4v4_beds_lost']),
+      kills: n(bedwarsStats['4v4v4v4_kills']),
+      deaths: n(bedwarsStats['4v4v4v4_deaths']),
+      assists: n(bedwarsStats['4v4v4v4_assists']),
+      final_kills: n(bedwarsStats['4v4v4v4_final_kills']),
+      final_deaths: n(bedwarsStats['4v4v4v4_final_deaths']),
+      final_assists: n(bedwarsStats['4v4v4v4_final_assists']),
+      wins: n(bedwarsStats['4v4v4v4_wins']),
+      losses: n(bedwarsStats['4v4v4v4_losses']),
+      games_played: n(bedwarsStats['4v4v4v4_games_played']),
+      winstreak: n(bedwarsStats['4v4v4v4_winstreak']),
+      max_winstreak: n(bedwarsStats['4v4v4v4_max_winstreak']),
+    };
+  }
+
+  return null;
+}
+
+function createModeSelect(currentMode = 'geral') {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('bedwars-mode-select')
+      .setPlaceholder('Selecione um modo')
+      .addOptions([
+        { label: 'Geral', value: 'geral', default: currentMode === 'geral' },
+        { label: 'Solo', value: 'solo', default: currentMode === 'solo' },
+        { label: 'Dupla', value: 'dupla', default: currentMode === 'dupla' },
+        { label: 'Trio', value: 'trio', default: currentMode === 'trio' },
+        { label: 'Quarteto', value: 'quarteto', default: currentMode === 'quarteto' },
+      ])
+  );
+}
+
+function createEmbed({ username, uniqueId, bw, stats, playTimeSeconds, mode }) {
+  const kdr = ratio(stats.deaths ? stats.kills : 0, stats.deaths);
+  const wlr = ratio(stats.losses ? stats.wins : 0, stats.losses);
+  const fkdr = ratio(stats.final_deaths ? stats.final_kills : 0, stats.final_deaths);
+  const bblr = ratio(stats.beds_lost ? stats.beds_broken : 0, stats.beds_lost);
+  const hours = (n(playTimeSeconds) / 3600).toFixed(2);
+  const winPct = getWinPercent(stats.wins, stats.games_played);
+
+  const xp = n(bw?.xp);
+  const xpCurrent = xp % 15000;
+  const xpMax = 15000;
+
+  const desc = [
+    `• **Nível:** [${n(bw?.level)}✽]`,
+    `• **XP:** ${fmt(xp)} ➜ [${fmt(xpCurrent)}/${fmt(xpMax)}]`,
+    ``,
+    `• **Camas quebradas:** ${fmt(stats.beds_broken)}`,
+    `• **Camas perdidas:** ${fmt(stats.beds_lost)}`,
+    ``,
+    `• **Abates:** ${fmt(stats.kills)}`,
+    `• **Mortes:** ${fmt(stats.deaths)}`,
+    `• **Assistências:** ${fmt(stats.assists)}`,
+    ``,
+    `• **Abates finais:** ${fmt(stats.final_kills)}`,
+    `• **Mortes finais:** ${fmt(stats.final_deaths)}`,
+    `• **Assistências finais:** ${fmt(stats.final_assists)}`,
+    ``,
+    `• **Vitórias:** ${fmt(stats.wins)} (${winPct}%)`,
+    `• **Derrotas:** ${fmt(stats.losses)}`,
+    `• **Partidas jogadas:** ${fmt(stats.games_played)}`,
+    `• **Tempo online:** ${hours} horas`,
+    ``,
+    `• **Winstreak:** ${fmt(stats.winstreak)}`,
+    `• **Maior Winstreak:** ${fmt(stats.max_winstreak)}`,
+    ``,
+    `• **KDR:** ${kdr}`,
+    `• **WLR:** ${wlr}`,
+    `• **FKDR:** ${fkdr}`,
+    `• **BBLR:** ${bblr}`,
+  ].join('\n');
+
+  return new EmbedBuilder()
+    .setTitle(`<:Caminha:1324521740411605002> • Bed Wars (${modeLabel(mode)}): ${username}`)
+    .setColor('#2b2d31')
+    .setThumbnail(uniqueId ? `https://visage.surgeplay.com/face/256/${uniqueId}` : null)
+    .setDescription(desc)
+    .setFooter({
+      text: `Desenvolvido por Lynn | Hoje às ${new Date().toLocaleTimeString('pt-BR', {
+        hour: '2-digit',
+        minute: '2-digit',
+      })}`,
+    })
+    .setTimestamp();
+}
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('bedwars')
-    .setDescription('[Mush] Verifique as estatísticas Gerais de um jogador no Bed Wars.')
+    .setDescription('[Mush] Verifique as estatísticas de um jogador no Bed Wars.')
     .addStringOption(option =>
       option
         .setName('nick')
@@ -13,188 +219,113 @@ module.exports = {
     ),
 
   async execute(interaction) {
-    const username = interaction.options.getString('nick');
+    await interaction.deferReply();
 
+    const usernameInput = interaction.options.getString('nick', true);
+
+    let api;
     try {
-      const response = await axios.get(`https://mush.com.br/api/player/${encodeURIComponent(username)}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
+      const response = await axios.get(`${MUSH_API}/${encodeURIComponent(usernameInput)}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        timeout: 20000,
       });
-
-      const data = response.data;
-
-      if (!data?.success || !data?.response?.stats?.bedwars) {
-        return interaction.reply({
-          content: '❌ Não foi possível encontrar as estatísticas desse jogador. (Pode estar nicked ou o nick está errado.)',
-          ephemeral: true
-        });
-      }
-
-      const bedwarsStats = data.response.stats.bedwars;
-      const playTime = data.response.stats?.play_time?.bedwars ?? 0;
-      const uniqueId = data.response.account?.unique_id;
-
-      const modes = [
-        { label: 'Geral', value: 'geral' },
-        { label: 'Solo', value: 'solo' },
-        { label: 'Dupla', value: 'dupla' },
-        { label: 'Trio', value: 'trio' },
-        { label: 'Quarteto', value: 'quarteto' },
-      ];
-
-      const selectMenu = new StringSelectMenuBuilder()
-        .setCustomId('select-mode-bedwars')
-        .setPlaceholder('Selecione um modo')
-        .addOptions(modes);
-
-      const row = new ActionRowBuilder().addComponents(selectMenu);
-
-      // Stats padrão = Geral
-      const embed = createEmbed(username, bedwarsStats, bedwarsStats, uniqueId, playTime, 'geral');
-
-      const msg = await interaction.reply({
-        embeds: [embed],
-        components: [row]
-      });
-
-      const filter = i => i.customId === 'select-mode-bedwars' && i.user.id === interaction.user.id;
-      const collector = interaction.channel.createMessageComponentCollector({ filter, time: 60000 });
-
-      collector.on('collect', async (i) => {
-        const selectedMode = i.values[0];
-
-        const stats = pickStatsByMode(selectedMode, bedwarsStats);
-
-        const updatedEmbed = createEmbed(username, bedwarsStats, stats, uniqueId, playTime, selectedMode);
-        await i.update({ embeds: [updatedEmbed], components: [row] });
-      });
-
-      collector.on('end', async () => {
-        // Desativa o menu ao expirar
-        try {
-          const disabledMenu = StringSelectMenuBuilder.from(selectMenu).setDisabled(true);
-          const disabledRow = new ActionRowBuilder().addComponents(disabledMenu);
-          await interaction.editReply({ components: [disabledRow] });
-        } catch {}
-      });
-
-      return msg;
-    } catch (error) {
-      console.error('Erro ao obter as estatísticas do jogador:', error?.message || error);
-      if (!interaction.replied && !interaction.deferred) {
-        return interaction.reply({
-          content: '❌ Não foi possível obter as estatísticas do jogador.',
-          ephemeral: true
-        });
-      }
-      return interaction.editReply({
-        content: '❌ Não foi possível obter as estatísticas do jogador.',
-        components: [],
-        embeds: []
-      });
+      api = response.data;
+    } catch (err) {
+      console.error('Erro ao consultar API Mush (bedwars):', err?.message || err);
+      return interaction.editReply('❌ Não foi possível obter as estatísticas do jogador agora.');
     }
-  }
+
+    if (!api?.success || !api?.response) {
+      return interaction.editReply('❌ Jogador não encontrado. (Pode estar nicked.)');
+    }
+
+    const player = api.response;
+    const account = player.account || {};
+    const username = account.username || usernameInput;
+    const uniqueId = account.unique_id || null;
+
+    const bedwarsStats = player?.stats?.bedwars;
+    const playTimeSeconds = player?.stats?.play_time?.bedwars || 0;
+
+    if (!bedwarsStats) {
+      return interaction.editReply(`❌ Não foi possível encontrar estatísticas de BedWars para **${username}**.`);
+    }
+
+    let currentMode = 'geral';
+    const currentStats = getModeStats(bedwarsStats, currentMode);
+
+    if (!currentStats) {
+      return interaction.editReply('❌ Não foi possível carregar as estatísticas do modo selecionado.');
+    }
+
+    const embed = createEmbed({
+      username,
+      uniqueId,
+      bw: bedwarsStats,
+      stats: currentStats,
+      playTimeSeconds,
+      mode: currentMode,
+    });
+
+    const row = createModeSelect(currentMode);
+
+    await interaction.editReply({
+      embeds: [embed],
+      components: [row],
+    });
+
+    const message = await interaction.fetchReply();
+
+    const collector = message.createMessageComponentCollector({
+      time: 60_000,
+      filter: (i) =>
+        i.customId === 'bedwars-mode-select' && i.user.id === interaction.user.id,
+    });
+
+    collector.on('collect', async (i) => {
+      try {
+        const selectedMode = i.values?.[0] || 'geral';
+        const selectedStats = getModeStats(bedwarsStats, selectedMode);
+
+        if (!selectedStats) {
+          return i.update({
+            content: '❌ Não foi possível carregar esse modo.',
+            embeds: [],
+            components: [],
+          });
+        }
+
+        currentMode = selectedMode;
+
+        const updatedEmbed = createEmbed({
+          username,
+          uniqueId,
+          bw: bedwarsStats,
+          stats: selectedStats,
+          playTimeSeconds,
+          mode: currentMode,
+        });
+
+        const updatedRow = createModeSelect(currentMode);
+
+        await i.update({
+          embeds: [updatedEmbed],
+          components: [updatedRow],
+        });
+      } catch (err) {
+        console.error('Erro no seletor de modo /bedwars:', err);
+        if (!i.replied && !i.deferred) {
+          await i.reply({ content: '❌ Ocorreu um erro ao trocar o modo.', ephemeral: true }).catch(() => {});
+        }
+      }
+    });
+
+    collector.on('end', async () => {
+      try {
+        await interaction.editReply({
+          components: [],
+        }).catch(() => {});
+      } catch {}
+    });
+  },
 };
-
-function pickStatsByMode(mode, bedwarsStats) {
-  switch (mode) {
-    case 'solo':
-      return {
-        beds_broken: bedwarsStats.solo_beds_broken,
-        beds_lost: bedwarsStats.solo_beds_lost,
-        kills: bedwarsStats.solo_kills,
-        deaths: bedwarsStats.solo_deaths,
-        assists: bedwarsStats.solo_assists,
-        final_kills: bedwarsStats.solo_final_kills,
-        final_deaths: bedwarsStats.solo_final_deaths,
-        final_assists: bedwarsStats.solo_final_assists,
-        wins: bedwarsStats.solo_wins,
-        losses: bedwarsStats.solo_losses,
-        games_played: bedwarsStats.solo_games_played,
-        winstreak: bedwarsStats.solo_winstreak,
-        max_winstreak: bedwarsStats.solo_max_winstreak,
-      };
-
-    case 'dupla':
-      return {
-        beds_broken: bedwarsStats.doubles_beds_broken,
-        beds_lost: bedwarsStats.doubles_beds_lost,
-        kills: bedwarsStats.doubles_kills,
-        deaths: bedwarsStats.doubles_deaths,
-        assists: bedwarsStats.doubles_assists,
-        final_kills: bedwarsStats.doubles_final_kills,
-        final_deaths: bedwarsStats.doubles_final_deaths,
-        final_assists: bedwarsStats.doubles_final_assists,
-        wins: bedwarsStats.doubles_wins,
-        losses: bedwarsStats.doubles_losses,
-        games_played: bedwarsStats.doubles_games_played,
-        winstreak: bedwarsStats.doubles_winstreak,
-        max_winstreak: bedwarsStats.doubles_max_winstreak,
-      };
-
-    case 'trio':
-      return {
-        beds_broken: bedwarsStats['3v3v3v3_beds_broken'],
-        beds_lost: bedwarsStats['3v3v3v3_beds_lost'],
-        kills: bedwarsStats['3v3v3v3_kills'],
-        deaths: bedwarsStats['3v3v3v3_deaths'],
-        assists: bedwarsStats['3v3v3v3_assists'],
-        final_kills: bedwarsStats['3v3v3v3_final_kills'],
-        final_deaths: bedwarsStats['3v3v3v3_final_deaths'],
-        final_assists: bedwarsStats['3v3v3v3_final_assists'],
-        wins: bedwarsStats['3v3v3v3_wins'],
-        losses: bedwarsStats['3v3v3v3_losses'],
-        games_played: bedwarsStats['3v3v3v3_games_played'],
-        winstreak: bedwarsStats['3v3v3v3_winstreak'],
-        max_winstreak: bedwarsStats['3v3v3v3_max_winstreak'],
-      };
-
-    case 'quarteto':
-      return {
-        beds_broken: bedwarsStats['4v4v4v4_beds_broken'],
-        beds_lost: bedwarsStats['4v4v4v4_beds_lost'],
-        kills: bedwarsStats['4v4v4v4_kills'],
-        deaths: bedwarsStats['4v4v4v4_deaths'],
-        assists: bedwarsStats['4v4v4v4_assists'],
-        final_kills: bedwarsStats['4v4v4v4_final_kills'],
-        final_deaths: bedwarsStats['4v4v4v4_final_deaths'],
-        final_assists: bedwarsStats['4v4v4v4_final_assists'],
-        wins: bedwarsStats['4v4v4v4_wins'],
-        losses: bedwarsStats['4v4v4v4_losses'],
-        games_played: bedwarsStats['4v4v4v4_games_played'],
-        winstreak: bedwarsStats['4v4v4v4_winstreak'],
-        max_winstreak: bedwarsStats['4v4v4v4_max_winstreak'],
-      };
-
-    default:
-      return bedwarsStats;
-  }
-}
-
-function createEmbed(username, bw, stats, uniqueId, playTimeSeconds, mode) {
-  const kdr  = stats?.deaths ? (Number(stats.kills || 0) / Number(stats.deaths || 1)).toFixed(2) : '0.00';
-  const wlr  = stats?.losses ? (Number(stats.wins || 0) / Number(stats.losses || 1)).toFixed(2) : '0.00';
-  const fkdr = stats?.final_deaths ? (Number(stats.final_kills || 0) / Number(stats.final_deaths || 1)).toFixed(2) : '0.00';
-  const bblr = stats?.beds_lost ? (Number(stats.beds_broken || 0) / Number(stats.beds_lost || 1)).toFixed(2) : '0.00';
-
-  const hours = (Number(playTimeSeconds || 0) / 3600).toFixed(2);
-
-  const modeTitle =
-    mode === 'solo' ? 'Solo' :
-    mode === 'dupla' ? 'Dupla' :
-    mode === 'trio' ? 'Trio' :
-    mode === 'quarteto' ? 'Quarteto' : 'Geral';
-
-  const desc = [
-    `• **Nível:** [${bw?.level ?? 0}✽]`,
-    `• **XP:** ${(bw?.xp ?? 0).toLocaleString('pt-BR')} → [${(bw?.xp ?? 0) % 15000}/15000]`,
-    ``,
-    `• **Camas quebradas:** ${(stats?.beds_broken ?? 0).toLocaleString('pt-BR')}`,
-    `• **Camas perdidas:** ${(stats?.beds_lost ?? 0).toLocaleString('pt-BR')}`,
-    ``,
-    `• **Abates:** ${(stats?.kills ?? 0).toLocaleString('pt-BR')}`,
-    `• **Mortes:** ${(stats?.deaths ?? 0).toLocaleString('pt-BR')}`,
-    `• **Assistências:** ${(stats?.assists ?? 0).toLocaleString('pt-BR')}`,
-    ``,
-    `• **Abates finais:** ${(stats?.final_kills ?? 0).toLocaleString('pt-BR')}`,
-    `• **Mortes finais:** ${(stats?.final_deaths ?? 0).toLocaleString('pt-BR')}`,
-    `• **Assistências finais:** ${(stats?.final_assists ?? 0_
