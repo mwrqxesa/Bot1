@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { Client, Collection, GatewayIntentBits, Events } = require('discord.js');
+const { Client, Collection, GatewayIntentBits, Events, ActivityType } = require('discord.js');
 const { REST } = require('@discordjs/rest');
 const { Routes } = require('discord-api-types/v9');
 const fs = require('node:fs');
@@ -42,6 +42,40 @@ const client = new Client({
 });
 
 client.commands = new Collection();
+
+// =====================
+// PRESENCE (Lynn Bot)
+// =====================
+function startLynnPresence(clientInstance) {
+  const activities = [
+    { name: 'Amando o Zangwdo', type: ActivityType.Watching },
+    { name: 'Protegendo o Zangwdo na Yakuza', type: ActivityType.Playing },
+    { name: 'Lealdade à Yakuza e ao Zangwdo', type: ActivityType.Listening },
+    { name: 'Dominando as calls da Yakuza', type: ActivityType.Competing },
+    { name: 'Guardando o coração do Zangwdo', type: ActivityType.Watching },
+    { name: 'Operação: Amar o Zangwdo', type: ActivityType.Playing },
+    { name: 'No submundo com Zangwdo', type: ActivityType.Watching },
+    { name: 'Juramento Yakuza ao Zangwdo', type: ActivityType.Listening },
+  ];
+
+  let index = 0;
+
+  const applyPresence = () => {
+    if (!clientInstance.user) return;
+
+    const activity = activities[index % activities.length];
+
+    clientInstance.user.setPresence({
+      status: 'online', // online | idle | dnd | invisible
+      activities: [activity],
+    });
+
+    index++;
+  };
+
+  applyPresence(); // aplica imediatamente
+  setInterval(applyPresence, 60_000); // troca a cada 1 minuto
+}
 
 // =====================
 // MANAGERS / SISTEMAS
@@ -149,6 +183,9 @@ const rest = new REST({ version: '9' }).setToken(TOKEN);
 // =====================
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot iniciado como ${client.user.tag}`);
+
+  // ✅ Atividades da Lynn Bot (Yakuza + Zangwdo)
+  startLynnPresence(client);
 
   // Registra slash commands (global)
   try {
