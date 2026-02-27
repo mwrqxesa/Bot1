@@ -139,7 +139,7 @@ class CallRankingManager {
   }
 
   // =========================
-  // AUTO-IMPORT JSON -> SQLITE (1ª vez)
+  // IMPORT JSON LEGADO -> SQLITE
   // =========================
   readLegacyJsonSafe(filePath) {
     try {
@@ -204,20 +204,19 @@ class CallRankingManager {
   }
 
   // =========================
-  // SNAPSHOTS / BACKUP
+  // SNAPSHOT / BACKUP
   // =========================
   async exportCurrentDataAsJsonObject() {
-    const usersRows = await this.all(`SELECT user_id, username, total_ms FROM call_users`);
+    const rows = await this.all(`SELECT user_id, username, total_ms FROM call_users`);
     const users = {};
 
-    for (const row of usersRows) {
+    for (const row of rows) {
       users[row.user_id] = {
         username: row.username || `ID ${row.user_id}`,
         totalMs: Number(row.total_ms || 0),
       };
-    }
-
-    return {
+  }
+                       return {
       users,
       rankingMessageId: this.cache.rankingMessageId || null,
     };
@@ -251,7 +250,7 @@ class CallRankingManager {
         .map(name => ({
           name,
           fullPath: path.join(this.dataDir, name),
-          mtime: fs.statSync(path.join(this.dataDir, name)).mtimeMs
+          mtime: fs.statSync(path.join(this.dataDir, name)).mtimeMs,
         }))
         .sort((a, b) => b.mtime - a.mtime);
 
@@ -285,7 +284,7 @@ class CallRankingManager {
     return `${guildId}:${userId}`;
   }
 
-  // ✅ sem converter pra dias
+  // ✅ somente horas e minutos
   formatMs(ms) {
     const totalMinutes = Math.floor((Number(ms) || 0) / 1000 / 60);
     const hours = Math.floor(totalMinutes / 60);
@@ -329,7 +328,7 @@ class CallRankingManager {
   }
 
   // =========================
-  // CARGOS POR HORAS (dark anime)
+  // CARGOS AUTOMÁTICOS (dark anime)
   // =========================
   getCallRankMap() {
     return {
@@ -351,7 +350,7 @@ class CallRankingManager {
       700: 'Fantasma',
       800: 'O Escolhido',
       900: 'Yakuza Suprema',
-      1000: 'Monarca das Calls'
+      1000: 'Monarca das Calls',
     };
   }
 
@@ -372,7 +371,7 @@ class CallRankingManager {
 
     return {
       milestone: reached,
-      title: this.getCallRankMap()[reached]
+      title: this.getCallRankMap()[reached],
     };
   }
 
@@ -395,7 +394,7 @@ class CallRankingManager {
       10: 0x7f8c8d, 20: 0x3498db, 30: 0x5865f2, 40: 0x9b59b6, 50: 0xe91e63,
       60: 0x8e44ad, 70: 0xc0392b, 80: 0x2c3e50, 90: 0x16a085, 100: 0xf39c12,
       200: 0xd35400, 300: 0x8e44ad, 400: 0x2c3e50, 500: 0xf1c40f, 600: 0x1abc9c,
-      700: 0x34495e, 800: 0xecf0f1, 900: 0xe74c3c, 1000: 0xffffff
+      700: 0x34495e, 800: 0xecf0f1, 900: 0xe74c3c, 1000: 0xffffff,
     };
 
     return map[hours] || 0x99aab5;
@@ -415,14 +414,14 @@ class CallRankingManager {
     return guild.roles.create({
       name: roleName,
       color,
-      reason: 'Cargo automático por horas em call'
+      reason: 'Cargo automático por horas em call',
     }).catch(() => null);
   }
 
   async updateMemberCallLevelRole(guild, userId) {
     const member = await guild.members.fetch(userId).catch(() => null);
 
-    // ✅ Lynn Bot pode contar; outros bots não
+    // ✅ permite Lynn Bot
     if (!member || !this.isTrackableUser(member.user)) return;
 
     const totalMs = await this.getTotalWithLiveMs(userId);
@@ -459,7 +458,6 @@ class CallRankingManager {
     if (!guild) return;
 
     const rows = await this.all(`SELECT user_id FROM call_users`);
-
     for (const row of rows) {
       try {
         await this.updateMemberCallLevelRole(guild, row.user_id);
@@ -541,7 +539,7 @@ class CallRankingManager {
       return;
     }
 
-    // troca de canal / mute / deaf etc. -> mantém sessão sem reset
+    // troca de canal / mute / deaf -> mantém sessão
   }
 
   // =========================
@@ -580,7 +578,7 @@ class CallRankingManager {
       month: '2-digit',
       year: 'numeric',
       hour: '2-digit',
-      minute: '2-digit'
+      minute: '2-digit',
     });
 
     return new EmbedBuilder()
@@ -590,7 +588,7 @@ class CallRankingManager {
       .addFields(
         { name: '👥 Em call agora', value: `**${onlineNow}** membro(s)`, inline: true },
         { name: '🔄 Atualização', value: 'A cada **5 minutos**', inline: true },
-        { name: '🕒 Última atualização', value: lastUpdate, inline: false }
+        { name: '🕒 Última atualização', value: lastUpdate, inline: false },
       )
       .setFooter({ text: 'Desenvolvido por Lynn' })
       .setTimestamp();
@@ -647,7 +645,7 @@ class CallRankingManager {
     await this.loadMeta();
     await this.restoreActiveSessionsFromDb();
 
-    // captura membros já em call ao ligar (inclui Lynn Bot)
+    // captura quem já está em call ao ligar (inclui Lynn Bot)
     for (const guild of this.client.guilds.cache.values()) {
       for (const voiceState of guild.voiceStates.cache.values()) {
         if (voiceState.channelId && voiceState.member && this.isTrackableUser(voiceState.member.user)) {
@@ -676,4 +674,9 @@ class CallRankingManager {
 
     if (this.snapshotInterval) clearInterval(this.snapshotInterval);
     this.snapshotInterval = setInterval(() => {
-      this.createSnapshotBackup()
+      this.createSnapshotBackup().catch?.(() => {});
+    }, this.snapshotBackupIntervalMs);
+  }
+}
+
+module.exports = CallRankingManager;
