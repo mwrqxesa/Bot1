@@ -3,6 +3,7 @@ require('dotenv').config();
 const { Client, Collection, GatewayIntentBits, Events, ActivityType } = require('discord.js');
 const { REST } = require('@discordjs/rest');
 const { Routes } = require('discord-api-types/v9');
+const { joinVoiceChannel, entersState, VoiceConnectionStatus, getVoiceConnection } = require('@discordjs/voice');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -14,9 +15,11 @@ const GuildSettingsManager = require('./managers/GuildSettingsManager');
 const CallRankingManager = require('./managers/CallRankingManager');
 
 // =====================
-// TOKEN
+// CONFIG
 // =====================
 const TOKEN = process.env.BOT_TOKEN || process.env.DISCORD_TOKEN;
+const AUTO_VOICE_CHANNEL_ID = '1476401616784724030'; // ✅ call fixa
+
 if (!TOKEN) {
   console.error('❌ Nenhum token encontrado. Configure BOT_TOKEN (ou DISCORD_TOKEN).');
   process.exit(1);
@@ -31,7 +34,7 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates, // ✅ necessário pro ranking de call
+    GatewayIntentBits.GuildVoiceStates, // ✅ necessário pro ranking + auto voice
   ],
   shards: 'auto',
   failIfNotExists: false,
@@ -74,7 +77,69 @@ function startLynnPresence(clientInstance) {
   };
 
   applyPresence(); // aplica imediatamente
-  setInterval(applyPresence, 60_000); // troca a cada 1 minuto
+  setInterval(applyPresence, 60_000); // troca a cada 1 min
+}
+
+// =====================
+// AUTO JOIN VOICE
+// =====================
+async function autoJoinSpecificVoiceChannel(clientInstance) {
+  try {
+    if (!AUTO_VOICE_CHANNEL_ID) return;
+
+    let voiceChannel = null;
+
+    // procura no cache primeiro
+    for (const guild of clientInstance.guilds.cache.values()) {
+      const ch = guild.channels.cache.get(AUTO_VOICE_CHANNEL_ID);
+      if (ch) {
+        voiceChannel = ch;
+        break;
+      }
+    }
+
+    // fallback: fetch em cada guild
+    if (!voiceChannel) {
+      for (const guild of clientInstance.guilds.cache.values()) {
+        const ch = await guild.channels.fetch(AUTO_VOICE_CHANNEL_ID).catch(() => null);
+        if (ch) {
+          voiceChannel = ch;
+          break;
+        }
+      }
+    }
+
+    if (!voiceChannel) {
+      console.warn(`⚠️ Canal ${AUTO_VOICE_CHANNEL_ID} não encontrado.`);
+      return;
+    }
+
+    if (!voiceChannel.isVoiceBased?.()) {
+      console.warn(`⚠️ O canal ${AUTO_VOICE_CHANNEL_ID} não é de voz.`);
+      return;
+    }
+
+    // evita duplicar conexão
+    const existing = getVoiceConnection(voiceChannel.guild.id);
+    if (existing) {
+      console.log(`ℹ️ Já existe conexão de voz na guild ${voiceChannel.guild.id}.`);
+      return;
+    }
+
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: voiceChannel.guild.id,
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+      selfDeaf: true,
+      selfMute: true,
+    });
+
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+
+    console.log(`✅ Lynn Bot entrou automaticamente na call: ${voiceChannel.name} (${voiceChannel.id})`);
+  } catch (error) {
+    console.error('❌ Erro ao entrar automaticamente na call:', error);
+  }
 }
 
 // =====================
@@ -174,7 +239,7 @@ for (const file of eventFiles) {
 console.log(`✅ Events carregados: ${eventFiles.length}`);
 
 // =====================
-// REGISTRO DE COMANDOS SLASH
+// REGISTRO SLASH COMMANDS
 // =====================
 const rest = new REST({ version: '9' }).setToken(TOKEN);
 
@@ -184,10 +249,13 @@ const rest = new REST({ version: '9' }).setToken(TOKEN);
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot iniciado como ${client.user.tag}`);
 
-  // ✅ Atividades da Lynn Bot (Yakuza + Zangwdo)
+  // Atividades da Lynn Bot
   startLynnPresence(client);
 
-  // Registra slash commands (global)
+  // Entrar automaticamente na call específica
+  await autoJoinSpecificVoiceChannel(client);
+
+  // Registra slash commands (globais)
   try {
     await rest.put(
       Routes.applicationCommands(client.user.id),
@@ -208,7 +276,7 @@ client.once(Events.ClientReady, async () => {
     await client.players.init();
     await client.clans.init();
 
-    // Se seu projeto depende dessa reinicialização
+    // Se seu sistema usa essa reinstância
     client.recruitmentManager = new RecruitmentManager(client);
 
     await client.callRanking.init();
@@ -221,7 +289,7 @@ client.once(Events.ClientReady, async () => {
 });
 
 // =====================
-// INTERAÇÕES (slash, botões, modais)
+// INTERAÇÕES (slash / botão / modal)
 // =====================
 client.on('interactionCreate', async (interaction) => {
   try {
@@ -257,13 +325,11 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton()) {
       const id = interaction.customId;
 
-      // Botões de recrutamento / tickets
       if (['apply_recruitment', 'apply_aranked', 'close_ticket'].includes(id)) {
         await client.recruitmentManager.handleButton(interaction);
         return;
       }
 
-      // Botões do sistema CxC
       if (['cxc', 'parceria', 'accept_cxc', 'decline_cxc'].includes(id)) {
         const adminCxcCommand = client.commands.get('admincxc');
         if (adminCxcCommand?.handleButton) {
@@ -277,7 +343,6 @@ client.on('interactionCreate', async (interaction) => {
 
     // Modais
     if (interaction.isModalSubmit()) {
-      // Modal de edição de painel
       if (interaction.customId.startsWith('paineledit_')) {
         const parts = interaction.customId.split('_');
         const channelId = parts[2];
@@ -292,7 +357,6 @@ client.on('interactionCreate', async (interaction) => {
           return;
         }
 
-        // mantém sua lógica atual
         interaction.channel = channel;
         await client.recruitmentManager.handlePanelEditModal(interaction);
         return;
@@ -324,18 +388,18 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // =====================
-// TRACKING DE CALL (voice state)
+// TRACKING DE CALL (ranking)
 // =====================
 client.on('voiceStateUpdate', (oldState, newState) => {
   try {
-    client.callRanking?.handleVoiceStateUpdate(oldState, newState); // ✅ método correto
+    client.callRanking?.handleVoiceStateUpdate(oldState, newState);
   } catch (err) {
     console.error('Erro no voiceStateUpdate do ranking:', err);
   }
 });
 
 // =====================
-// ERROS / LOGS
+// LOGS / ERROS
 // =====================
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
@@ -354,7 +418,7 @@ client.ws.on('error', (error) => {
 });
 
 // =====================
-// LOGIN (final do arquivo)
+// LOGIN
 // =====================
 client.login(TOKEN).catch((err) => {
   console.error('❌ Falha ao logar no Discord:', err);
