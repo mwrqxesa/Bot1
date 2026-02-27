@@ -8,6 +8,7 @@
     "dev": "nodemon index.js"
   },
   "dependencies": {
+    "@discordjs/voice": "^0.17.0",
     "axios": "^1.6.2",
     "canvas": "^3.0.1",
     "discord.js": "^14.14.1",
