@@ -18,7 +18,7 @@ const CallRankingManager = require('./managers/CallRankingManager');
 // CONFIG
 // =====================
 const TOKEN = process.env.BOT_TOKEN || process.env.DISCORD_TOKEN;
-const AUTO_VOICE_CHANNEL_ID = '1476401616784724030';
+const AUTO_VOICE_CHANNEL_ID = '1472461441452998727';
 const AUTO_VOICE_REJOIN_DELAY_MS = 5000;
 let autoVoiceReconnectTimeout = null;
 
