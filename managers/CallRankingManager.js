@@ -7,29 +7,30 @@ class CallRankingManager {
   constructor(client) {
     this.client = client;
 
-    // ====== CONFIG ======
-    // Neon/Postgres
+    // ====== DB / NEON ======
     this.databaseUrl = process.env.DATABASE_URL || null;
     this.pool = null;
 
-    // ✅ Ranking somente na Yakuza (fixo)
-    // Você já passou:
-    // Guild: 1476212383109087304
-    // Msg:   1477465092470608015
+    // ====== RANKING FIXO (YAKUZA) ======
     this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || "1476212383109087304";
-    this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || "1476212383109087304"; // ⚠️ troque pelo ID do CANAL correto se este não for o canal
+    this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null; // ✅ precisa ser o CANAL correto
     this.targetMessageId = process.env.CALL_RANKING_MESSAGE_ID || "1477465092470608015";
 
-    // Intervalos
-    this.updateIntervalMs = 5 * 60 * 1000; // 5 min
-    this.snapshotBackupIntervalMs = 10 * 60 * 60 * 1000; // 10h (opcional)
+    // ====== FILTROS (CAVE/BOT) ======
+    // Remover TOP7 da Cave + remover o bot da Yakuza do ranking
+    this.excludedUserIds = new Set([
+      "1098636834680094821", // TOP 7 (Cave)
+      "1237058787093905510", // bot da Yakuza (não mostrar no ranking)
+    ]);
+
+    // ====== INTERVALOS ======
+    this.updateIntervalMs = 5 * 60 * 1000;
+    this.snapshotBackupIntervalMs = 10 * 60 * 60 * 1000;
 
     // ====== STATE ======
-    this.activeSessions = new Map(); // key(guild:user) => startedAt(ms)
+    this.activeSessions = new Map(); // "guild:user" => startedAt(ms)
     this.interval = null;
     this.snapshotInterval = null;
-
-    // ✅ “modo seguro”: se banco falhar, não spamma erro em voiceStateUpdate
     this.enabled = false;
 
     // snapshots locais (opcional)
@@ -52,8 +53,6 @@ class CallRankingManager {
       return false;
     }
 
-    // ✅ Força SSL no Node/pg (Neon costuma exigir).
-    // Mesmo que sua URL tenha sslmode=require, isso ajuda a evitar dor de cabeça.
     this.pool = new Pool({
       connectionString: this.databaseUrl,
       ssl: { rejectUnauthorized: false },
@@ -62,7 +61,6 @@ class CallRankingManager {
       connectionTimeoutMillis: 15_000,
     });
 
-    // testa conexão
     await this.pool.query("SELECT 1");
     return true;
   }
@@ -101,9 +99,7 @@ class CallRankingManager {
   // =========================
   isTrackableUser(user) {
     if (!user) return false;
-    // ✅ permite o próprio bot (para seu 24/7 se você quiser contar)
-    if (this.client?.user && user.id === this.client.user.id) return true;
-    // ❌ ignora outros bots
+    // ❌ ignora bots (incluindo o seu bot)
     if (user.bot) return false;
     return true;
   }
@@ -123,16 +119,24 @@ class CallRankingManager {
   }
 
   getLiveMs(guildId, userId) {
-    const gid = String(guildId);
-    const uid = String(userId);
-    const k = `${gid}:${uid}`;
+    const k = this.key(guildId, userId);
     const startedAt = this.activeSessions.get(k);
     if (!startedAt) return 0;
     return Math.max(0, Date.now() - startedAt);
   }
 
+  msFromAmount(amount, unit) {
+    const n = Number(amount);
+    if (!Number.isFinite(n) || n < 0) throw new Error("Quantidade inválida.");
+
+    const u = String(unit || "hours").toLowerCase();
+    if (u === "minutes" || u === "min" || u === "m") return Math.round(n * 60 * 1000);
+    // default: horas
+    return Math.round(n * 60 * 60 * 1000);
+  }
+
   // =========================
-  // Users / totals
+  // USERS / TOTALS
   // =========================
   async touchUser(guildId, user) {
     if (!this.enabled) return;
@@ -147,6 +151,99 @@ class CallRankingManager {
       `,
       [String(guildId), String(user.id), user.username]
     );
+  }
+
+  // ✅ Isso resolve o "0.00 horas" (pega banco + ao vivo)
+  async getUserTotalMs(guildId, userId) {
+    if (!this.enabled) return 0;
+
+    const res = await this.query(
+      `SELECT total_ms FROM call_users WHERE guild_id = $1 AND user_id = $2`,
+      [String(guildId), String(userId)]
+    );
+
+    const stored = Number(res.rows?.[0]?.total_ms || 0);
+    const live = this.getLiveMs(guildId, userId);
+    return stored + live;
+  }
+
+  // ✅ soma tempo (horas/minutos) no banco
+  async addTimeToUser(guildId, userId, username, amount, unit = "hours") {
+    if (!this.enabled) throw new Error("CallRanking desativado (sem DB).");
+
+    const ms = this.msFromAmount(amount, unit);
+
+    await this.query(
+      `
+      INSERT INTO call_users (guild_id, user_id, username, total_ms)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (guild_id, user_id)
+      DO UPDATE SET
+        username = EXCLUDED.username,
+        total_ms = call_users.total_ms + EXCLUDED.total_ms
+      `,
+      [String(guildId), String(userId), String(username || `ID ${userId}`), ms]
+    );
+
+    return ms;
+  }
+
+  // ✅ transfere tempo (tira de 1 e coloca no outro)
+  async transferTime(guildId, fromUser, toUser, amount, unit = "hours") {
+    if (!this.enabled) throw new Error("CallRanking desativado (sem DB).");
+    if (!fromUser || !toUser) throw new Error("Usuários inválidos.");
+    if (String(fromUser.id) === String(toUser.id)) throw new Error("Não pode transferir para si mesmo.");
+
+    const ms = this.msFromAmount(amount, unit);
+
+    // saldo atual de quem vai transferir
+    const fromTotal = await this.getUserTotalMs(guildId, fromUser.id);
+    if (fromTotal < ms) {
+      throw new Error(
+        `Saldo insuficiente: ${fromUser} tem ${this.formatMs(fromTotal)} e tentou transferir ${this.formatMs(ms)}.`
+      );
+    }
+
+    // Para não “bagunçar” sessão ao vivo:
+    // desconta do stored (banco) apenas, mas garantindo que stored >= 0
+    // (se quiser, eu posso “congelar” a sessão antes, mas aqui fica estável)
+    await this.query("BEGIN");
+
+    try {
+      // garante registros
+      await this.touchUser(guildId, fromUser);
+      await this.touchUser(guildId, toUser);
+
+      // desconta do FROM
+      // (não deixa negativo)
+      await this.query(
+        `
+        UPDATE call_users
+        SET total_ms = GREATEST(0, total_ms - $3),
+            username = $4
+        WHERE guild_id = $1 AND user_id = $2
+        `,
+        [String(guildId), String(fromUser.id), ms, String(fromUser.username)]
+      );
+
+      // soma no TO
+      await this.query(
+        `
+        UPDATE call_users
+        SET total_ms = total_ms + $3,
+            username = $4
+        WHERE guild_id = $1 AND user_id = $2
+        `,
+        [String(guildId), String(toUser.id), ms, String(toUser.username)]
+      );
+
+      await this.query("COMMIT");
+    } catch (e) {
+      await this.query("ROLLBACK");
+      throw e;
+    }
+
+    return ms;
   }
 
   // =========================
@@ -217,7 +314,6 @@ class CallRankingManager {
   // Events
   // =========================
   async handleVoiceStateUpdate(oldState, newState) {
-    // ✅ se DB caiu, não faz nada (evita spam)
     if (!this.enabled) return;
 
     const member = newState.member || oldState.member;
@@ -227,7 +323,7 @@ class CallRankingManager {
     const userId = member.id;
     if (!guildId || !userId) return;
 
-    // ✅ ranking só na Yakuza: ignora outros servidores
+    // ✅ ranking só na Yakuza (do jeito que você pediu)
     if (String(guildId) !== String(this.targetGuildId)) return;
 
     const wasIn = !!oldState.channelId;
@@ -239,8 +335,7 @@ class CallRankingManager {
       if (!wasIn && isIn) await this.startSession(guildId, userId);
       if (wasIn && !isIn) await this.stopSession(guildId, userId);
     } catch (err) {
-      // se der erro aqui, desabilita para parar avalanche
-      console.error("❌ [CallRanking] erro em voiceStateUpdate, desabilitando:", err?.message || err);
+      console.error("❌ [CallRanking] erro no voiceStateUpdate, desabilitando:", err?.message || err);
       this.enabled = false;
     }
   }
@@ -259,6 +354,8 @@ class CallRankingManager {
         userId: String(row.user_id),
         totalMs: Number(row.total_ms || 0) + this.getLiveMs(guild.id, row.user_id),
       }))
+      // ✅ remove ids “da cave”/bot
+      .filter((u) => !this.excludedUserIds.has(u.userId))
       .sort((a, b) => b.totalMs - a.totalMs);
 
     const top = ranking.slice(0, 15);
@@ -315,9 +412,9 @@ class CallRankingManager {
     if (!msg) {
       console.error(
         `[CallRanking] Não consegui buscar a msg fixa ${this.targetMessageId} no canal ${this.targetChannelId}. ` +
-          `Confere permissão "Read Message History".`
+          `Confere "Read Message History".`
       );
-      return; // ❌ não cria nova msg
+      return;
     }
 
     const embed = await this.buildEmbedForGuild(guild);
@@ -362,7 +459,6 @@ class CallRankingManager {
 
       const json = await this.exportCurrentDataAsJsonObject();
       fs.writeFileSync(snapshotPath, JSON.stringify(json, null, 2));
-
       console.log(`[CallRanking] Snapshot criado: ${filename}`);
     } catch (err) {
       console.warn("[CallRanking] Snapshot falhou:", err?.message || err);
@@ -370,69 +466,9 @@ class CallRankingManager {
   }
 
   // =========================
-  // Import do seu “backup base” (OPCIONAL)
-  // =========================
-  // Formato esperado do arquivo:
-  // {
-  //   "usersByGuild": {
-  //     "1476212383109087304": {
-  //       "123": { "username": "Fulano", "totalMs": 123456 }
-  //     }
-  //   }
-  // }
-  async importBaseSnapshotIfProvided() {
-    if (!this.enabled) return;
-
-    const filePath = process.env.CALL_RANKING_IMPORT_JSON || null;
-    if (!filePath) return;
-
-    try {
-      if (!fs.existsSync(filePath)) {
-        console.warn(`[CallRanking] IMPORT_JSON definido mas arquivo não existe: ${filePath}`);
-        return;
-      }
-
-      const raw = fs.readFileSync(filePath, "utf8");
-      const json = JSON.parse(raw);
-
-      const gid = String(this.targetGuildId);
-      const map = json?.usersByGuild?.[gid];
-      if (!map || typeof map !== "object") {
-        console.warn("[CallRanking] Import JSON não tem usersByGuild para a guild alvo.");
-        return;
-      }
-
-      // upsert “base” (se já tiver mais horas no banco, não diminui)
-      // regra: total_ms = GREATEST(total_ms, incoming_total)
-      const entries = Object.entries(map);
-      for (const [userId, data] of entries) {
-        const username = data?.username || `ID ${userId}`;
-        const totalMs = Number(data?.totalMs || 0);
-
-        await this.query(
-          `
-          INSERT INTO call_users (guild_id, user_id, username, total_ms)
-          VALUES ($1, $2, $3, $4)
-          ON CONFLICT (guild_id, user_id)
-          DO UPDATE SET
-            username = EXCLUDED.username,
-            total_ms = GREATEST(call_users.total_ms, EXCLUDED.total_ms)
-          `,
-          [gid, String(userId), String(username), totalMs]
-        );
-      }
-
-      console.log(`✅ [CallRanking] Import base aplicado (${entries.length} usuários).`);
-    } catch (err) {
-      console.error("❌ [CallRanking] Falha ao importar base:", err?.message || err);
-    }
-  }
-
-  // =========================
   // INIT
   // =========================
   async init() {
-    // evita crash geral caso falhe
     try {
       const ok = await this.connectDb().catch((e) => {
         console.error("❌ [CallRanking] Falha ao conectar no Neon:", e?.message || e);
@@ -445,14 +481,17 @@ class CallRankingManager {
         return;
       }
 
+      if (!this.targetChannelId) {
+        // ✅ evita aquele erro silencioso (canal errado)
+        console.error("❌ [CallRanking] CALL_RANKING_CHANNEL_ID não definido (canal da mensagem do ranking).");
+        this.enabled = false;
+        return;
+      }
+
       this.enabled = true;
 
       await this.initDbSchema();
       await this.restoreActiveSessionsFromDb();
-
-      // ✅ aplica seu “backup base” se você passar o caminho (CALL_RANKING_IMPORT_JSON)
-      // Isso resolve seu ponto: “tenho dados base do último backup”
-      await this.importBaseSnapshotIfProvided();
 
       // captura quem já está em call ao ligar (somente yakuza)
       const guild = this.client.guilds.cache.get(String(this.targetGuildId));
@@ -461,21 +500,20 @@ class CallRankingManager {
           if (!voiceState.channelId || !voiceState.member) continue;
           if (!this.isTrackableUser(voiceState.member.user)) continue;
 
+          const userId = voiceState.member.id; // ✅ CORRETO (não é voiceState.id)
           await this.touchUser(guild.id, voiceState.member.user);
 
-          const k = this.key(guild.id, voiceState.id);
+          const k = this.key(guild.id, userId);
           if (!this.activeSessions.has(k)) {
-            await this.startSession(guild.id, voiceState.id);
+            await this.startSession(guild.id, userId);
           }
         }
       }
 
-      // update inicial (edita msg fixa)
       await this.updateRankingMessage().catch((err) => {
         console.error("[CallRanking] Erro na atualização inicial:", err?.message || err);
       });
 
-      // timers
       if (this.interval) clearInterval(this.interval);
       this.interval = setInterval(() => {
         this.updateRankingMessage().catch((err) => {
@@ -495,7 +533,6 @@ class CallRankingManager {
     }
   }
 
-  // (opcional) encerrar pool
   async close() {
     try {
       if (this.interval) clearInterval(this.interval);
