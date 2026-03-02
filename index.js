@@ -1,19 +1,3 @@
-/**
- * index.js (refeito)
- * - Mantém o bot 24/7 em 2 calls (Cave e Yakuza) ao mesmo tempo (uma por guild).
- * - Reconecta automaticamente se cair / for movido / for desconectado.
- * - Ranking de call fica SEPARADO por servidor (guildId). Tempo da Cave NÃO afeta Yakuza.
- * - Um único voiceStateUpdate (ranking + auto-247) para evitar duplicidade.
- *
- * Requisitos:
- * - discord.js v14
- * - @discordjs/voice
- *
- * Observação importante:
- * - Eu removi @discordjs/rest e discord-api-types/v9 e passei a usar REST/Routes do próprio discord.js
- *   (assim você evita erro de dependências faltando).
- */
-
 require("dotenv").config();
 
 const fs = require("node:fs");
