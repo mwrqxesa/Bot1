@@ -1,0 +1,8 @@
+{
+  "friendlyName": "Cave",
+  "autoVoice": {
+    "enabled": true,
+    "channelId": "1472461441452998727",
+    "label": "call_247"
+  }
+}
