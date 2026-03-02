@@ -1,31 +1,57 @@
-const fs = require('node:fs');
-const path = require('node:path');
-const { EmbedBuilder } = require('discord.js');
-const sqlite3 = require('sqlite3').verbose();
+/**
+ * CallRankingManager (REFEITO)
+ *
+ * ✅ Separa ranking por servidor (guild_id + user_id)
+ * ✅ Nunca mistura Cave com Yakuza
+ * ✅ Atualiza a MESMA mensagem (edit), não fica reenviando
+ * ✅ Suporta 1 ou múltiplos rankings (targets) via env
+ * ✅ Mantém sessões ativas (call_sessions) por guild
+ * ✅ Snapshot/backup inclui dados por guild
+ *
+ * IMPORTANTE sobre “reenviar toda vez”:
+ * - Se o bot NÃO tiver permissão "Read Message History" no canal do ranking,
+ *   ele não consegue buscar a mensagem antiga para editar e vai enviar outra nova.
+ *   Garanta no canal do ranking:
+ *   ✅ View Channel, Send Messages, Embed Links, Read Message History
+ *
+ * ENV suportadas:
+ * - CALL_RANKING_TARGETS (recomendado): JSON
+ *   Exemplo:
+ *   CALL_RANKING_TARGETS=[{"guildId":"1237058787093905510","channelId":"SEU_CANAL_RANKING_YAKUZA"}]
+ *
+ * - Fallback (se não usar JSON):
+ *   CALL_RANKING_GUILD_ID=...
+ *   CALL_RANKING_CHANNEL_ID=...
+ */
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { EmbedBuilder } = require("discord.js");
+const sqlite3 = require("sqlite3").verbose();
 
 class CallRankingManager {
   constructor(client) {
     this.client = client;
 
-    this.dataDir = path.join(__dirname, '..', 'data');
-    this.dbPath = path.join(this.dataDir, 'call_ranking.sqlite');
-    this.legacyJsonPath = path.join(this.dataDir, 'call_ranking.json');
-    this.legacyBackupJsonPath = path.join(this.dataDir, 'call_ranking.backup.json');
+    this.dataDir = path.join(__dirname, "..", "data");
+    this.dbPath = path.join(this.dataDir, "call_ranking.sqlite");
 
-    this.activeSessions = new Map(); // guildId:userId => startedAt
-    this.interval = null;
+    this.legacyJsonPath = path.join(this.dataDir, "call_ranking.json");
+    this.legacyBackupJsonPath = path.join(this.dataDir, "call_ranking.backup.json");
+
+    this.activeSessions = new Map(); // session_key(guild:user) => startedAt
     this.updateIntervalMs = 5 * 60 * 1000; // 5 min
-
     this.snapshotBackupIntervalMs = 10 * 60 * 60 * 1000; // 10h
+
+    this.interval = null;
     this.snapshotInterval = null;
     this.lastSnapshotAt = 0;
 
-    this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || null;
-    this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null;
-
     this.db = null;
+
+    // cache local (carregado via meta)
     this.cache = {
-      rankingMessageId: null,
+      rankingMessageIds: new Map(), // guildId -> messageId
     };
   }
 
@@ -77,11 +103,14 @@ class CallRankingManager {
   }
 
   async initDbSchema() {
+    // call_users agora é por guild
     await this.run(`
       CREATE TABLE IF NOT EXISTS call_users (
-        user_id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
         username TEXT,
-        total_ms INTEGER NOT NULL DEFAULT 0
+        total_ms INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (guild_id, user_id)
       )
     `);
 
@@ -100,8 +129,15 @@ class CallRankingManager {
         started_at INTEGER NOT NULL
       )
     `);
+
+    // Índices úteis
+    await this.run(`CREATE INDEX IF NOT EXISTS idx_call_users_guild ON call_users (guild_id)`);
+    await this.run(`CREATE INDEX IF NOT EXISTS idx_call_sessions_guild ON call_sessions (guild_id)`);
   }
 
+  // =========================
+  // META
+  // =========================
   async getMeta(key) {
     const row = await this.get(`SELECT value FROM call_meta WHERE key = ?`, [key]);
     return row?.value ?? null;
@@ -113,23 +149,33 @@ class CallRankingManager {
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       [String(key), value == null ? null : String(value)]
     );
-
-    if (key === 'rankingMessageId') {
-      this.cache.rankingMessageId = value == null ? null : String(value);
-    }
   }
 
-  async loadMeta() {
-    this.cache.rankingMessageId = await this.getMeta('rankingMessageId');
+  metaKeyRankingMessageId(guildId) {
+    return `rankingMessageId:${guildId}`;
+  }
+
+  async loadMetaForGuild(guildId) {
+    const msgId = await this.getMeta(this.metaKeyRankingMessageId(guildId));
+    if (msgId) this.cache.rankingMessageIds.set(String(guildId), String(msgId));
+  }
+
+  async setRankingMessageId(guildId, messageId) {
+    const gid = String(guildId);
+    const mid = messageId == null ? null : String(messageId);
+
+    await this.setMeta(this.metaKeyRankingMessageId(gid), mid);
+    if (mid) this.cache.rankingMessageIds.set(gid, mid);
+    else this.cache.rankingMessageIds.delete(gid);
   }
 
   // =========================
-  // TRACK RULES (permite Lynn Bot)
+  // TRACK RULES (permite seu bot)
   // =========================
   isTrackableUser(user) {
     if (!user) return false;
 
-    // ✅ Permite a própria Lynn Bot
+    // ✅ Permite o próprio bot (pra contar horas dele também, se quiser)
     if (this.client?.user && user.id === this.client.user.id) return true;
 
     // ❌ Ignora outros bots
@@ -139,142 +185,41 @@ class CallRankingManager {
   }
 
   // =========================
-  // IMPORT JSON LEGADO -> SQLITE
+  // TARGETS (onde postar ranking)
   // =========================
-  readLegacyJsonSafe(filePath) {
-    try {
-      if (!fs.existsSync(filePath)) return null;
-      const raw = fs.readFileSync(filePath, 'utf8');
-      const json = JSON.parse(raw);
-
-      if (!json || typeof json !== 'object') return null;
-      if (!json.users || typeof json.users !== 'object') json.users = {};
-      if (!('rankingMessageId' in json)) json.rankingMessageId = null;
-
-      return json;
-    } catch (err) {
-      console.warn(`[CallRanking] Falha ao ler JSON legado (${path.basename(filePath)}):`, err?.message || err);
-      return null;
-    }
-  }
-
-  async countUsersInDb() {
-    const row = await this.get(`SELECT COUNT(*) AS count FROM call_users`);
-    return Number(row?.count || 0);
-  }
-
-  async autoImportLegacyJsonIfNeeded() {
-    const dbUserCount = await this.countUsersInDb();
-    if (dbUserCount > 0) return;
-
-    const legacy =
-      this.readLegacyJsonSafe(this.legacyJsonPath) ||
-      this.readLegacyJsonSafe(this.legacyBackupJsonPath);
-
-    if (!legacy) {
-      console.log('[CallRanking] Nenhum JSON legado encontrado para importação automática.');
-      return;
-    }
-
-    const entries = Object.entries(legacy.users || {});
-
-    if (entries.length === 0 && !legacy.rankingMessageId) {
-      console.log('[CallRanking] JSON legado vazio, nada para importar.');
-      return;
-    }
-
-    for (const [userId, info] of entries) {
-      const username = info?.username || `ID ${userId}`;
-      const totalMs = Number(info?.totalMs || 0);
-
-      await this.run(
-        `INSERT INTO call_users (user_id, username, total_ms)
-         VALUES (?, ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, total_ms = excluded.total_ms`,
-        [String(userId), username, totalMs]
-      );
-    }
-
-    if (legacy.rankingMessageId) {
-      await this.setMeta('rankingMessageId', String(legacy.rankingMessageId));
-    }
-
-    await this.setMeta('legacyJsonImportedAt', String(Date.now()));
-    console.log(`[CallRanking] Importação automática concluída: ${entries.length} usuário(s) do JSON legado.`);
-  }
-
-  // =========================
-  // SNAPSHOT / BACKUP
-  // =========================
-  async exportCurrentDataAsJsonObject() {
-    const rows = await this.all(`SELECT user_id, username, total_ms FROM call_users`);
-    const users = {};
-
-    for (const row of rows) {
-      users[row.user_id] = {
-        username: row.username || `ID ${row.user_id}`,
-        totalMs: Number(row.total_ms || 0),
-      };
-  }
-                       return {
-      users,
-      rankingMessageId: this.cache.rankingMessageId || null,
-    };
-  }
-
-  async createSnapshotBackup() {
-    try {
-      this.ensureStorage();
-
-      const now = new Date();
-      const pad = (n) => String(n).padStart(2, '0');
-      const filename = `call_ranking.snapshot.${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
-      const snapshotPath = path.join(this.dataDir, filename);
-
-      const json = await this.exportCurrentDataAsJsonObject();
-      fs.writeFileSync(snapshotPath, JSON.stringify(json, null, 2));
-
-      this.lastSnapshotAt = Date.now();
-      console.log(`[CallRanking] Snapshot criado: ${filename}`);
-
-      this.cleanupOldSnapshots(10);
-    } catch (err) {
-      console.error('[CallRanking] Erro ao criar snapshot backup:', err);
-    }
-  }
-
-  cleanupOldSnapshots(keep = 10) {
-    try {
-      const files = fs.readdirSync(this.dataDir)
-        .filter(name => name.startsWith('call_ranking.snapshot.') && name.endsWith('.json'))
-        .map(name => ({
-          name,
-          fullPath: path.join(this.dataDir, name),
-          mtime: fs.statSync(path.join(this.dataDir, name)).mtimeMs,
-        }))
-        .sort((a, b) => b.mtime - a.mtime);
-
-      for (const file of files.slice(keep)) {
-        fs.unlinkSync(file.fullPath);
-        console.log(`[CallRanking] Snapshot antigo removido: ${file.name}`);
+  parseTargetsFromEnv() {
+    // Recomendado: JSON
+    const raw = process.env.CALL_RANKING_TARGETS;
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .filter((x) => x && x.guildId && x.channelId)
+            .map((x) => ({
+              guildId: String(x.guildId),
+              channelId: String(x.channelId),
+            }));
+        }
+      } catch (e) {
+        console.warn("[CallRanking] CALL_RANKING_TARGETS inválido (JSON). Ignorando.");
       }
-    } catch (err) {
-      console.warn('[CallRanking] Falha ao limpar snapshots antigos:', err?.message || err);
     }
+
+    // Fallback: 1 guild
+    const gid = process.env.CALL_RANKING_GUILD_ID;
+    const cid = process.env.CALL_RANKING_CHANNEL_ID;
+    if (gid && cid) {
+      return [{ guildId: String(gid), channelId: String(cid) }];
+    }
+
+    return [];
   }
 
-  async createManualBackupPayload() {
-    const data = await this.exportCurrentDataAsJsonObject();
-    const now = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-
-    const fileName = `call_ranking_backup_${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
-
-    return {
-      fileName,
-      buffer: Buffer.from(JSON.stringify(data, null, 2), 'utf8'),
-      data,
-    };
+  getTargets() {
+    // Você pode também puxar do GuildSettingsManager se quiser,
+    // mas como você já usa env, vamos manter simples e determinístico.
+    return this.parseTargetsFromEnv();
   }
 
   // =========================
@@ -294,63 +239,71 @@ class CallRankingManager {
     return `${minutes}m`;
   }
 
-  async touchUser(user) {
+  // =========================
+  // USERS / TOTALS (por guild)
+  // =========================
+  async touchUser(guildId, user) {
     if (!this.isTrackableUser(user)) return;
 
     await this.run(
-      `INSERT INTO call_users (user_id, username, total_ms)
-       VALUES (?, ?, 0)
-       ON CONFLICT(user_id) DO UPDATE SET username = excluded.username`,
-      [String(user.id), user.username]
+      `INSERT INTO call_users (guild_id, user_id, username, total_ms)
+       VALUES (?, ?, ?, 0)
+       ON CONFLICT(guild_id, user_id) DO UPDATE SET username = excluded.username`,
+      [String(guildId), String(user.id), user.username]
     );
   }
 
-  async getStoredTotalMs(userId) {
-    const row = await this.get(`SELECT total_ms FROM call_users WHERE user_id = ?`, [String(userId)]);
+  async getStoredTotalMs(guildId, userId) {
+    const row = await this.get(
+      `SELECT total_ms FROM call_users WHERE guild_id = ? AND user_id = ?`,
+      [String(guildId), String(userId)]
+    );
     return Number(row?.total_ms || 0);
   }
 
-  getLiveMs(userId) {
+  getLiveMs(guildId, userId) {
     let total = 0;
+    const prefix = `${String(guildId)}:`;
+    const uid = String(userId);
 
     for (const [k, startedAt] of this.activeSessions.entries()) {
-      const [, uid] = k.split(':');
-      if (uid === String(userId)) {
-        total += (Date.now() - startedAt);
-      }
+      if (!k.startsWith(prefix)) continue;
+      const [, kUserId] = k.split(":");
+      if (kUserId === uid) total += Date.now() - startedAt;
     }
 
     return total;
   }
 
-  async getTotalWithLiveMs(userId) {
-    return (await this.getStoredTotalMs(userId)) + this.getLiveMs(userId);
+  async getTotalWithLiveMs(guildId, userId) {
+    return (await this.getStoredTotalMs(guildId, userId)) + this.getLiveMs(guildId, userId);
   }
 
   // =========================
-  // CARGOS AUTOMÁTICOS (dark anime)
+  // CARGOS AUTOMÁTICOS
+  // (se você quiser só na Yakuza, coloque target só na Yakuza)
   // =========================
   getCallRankMap() {
     return {
-      10: 'Novato',
-      20: 'Desperto',
-      30: 'Vigilante',
-      40: 'Executor',
-      50: 'Tenente',
-      60: 'Magnífico',
-      70: 'Ceifador',
-      80: 'Portador do Véu',
-      90: 'Anbu',
-      100: 'Magnata',
-      200: 'Patriarca',
-      300: 'Shogun',
-      400: 'Imperador',
-      500: 'Lenda',
-      600: 'Soberano',
-      700: 'Fantasma',
-      800: 'O Escolhido',
-      900: 'Yakuza Suprema',
-      1000: 'Monarca das Calls',
+      10: "Novato",
+      20: "Desperto",
+      30: "Vigilante",
+      40: "Executor",
+      50: "Tenente",
+      60: "Magnífico",
+      70: "Ceifador",
+      80: "Portador do Véu",
+      90: "Anbu",
+      100: "Magnata",
+      200: "Patriarca",
+      300: "Shogun",
+      400: "Imperador",
+      500: "Lenda",
+      600: "Soberano",
+      700: "Fantasma",
+      800: "O Escolhido",
+      900: "Yakuza Suprema",
+      1000: "Monarca das Calls",
     };
   }
 
@@ -384,9 +337,7 @@ class CallRankingManager {
     if (!roleName) return false;
 
     const rankMap = this.getCallRankMap();
-    return Object.entries(rankMap).some(([h, title]) =>
-      this.formatCallRoleName(Number(h), title) === roleName
-    );
+    return Object.entries(rankMap).some(([h, title]) => this.formatCallRoleName(Number(h), title) === roleName);
   }
 
   getCallRoleColor(hours) {
@@ -401,39 +352,39 @@ class CallRankingManager {
   }
 
   async ensureCallRole(guild, roleName, hours) {
-    let role = guild.roles.cache.find(r => r.name === roleName);
+    let role = guild.roles.cache.find((r) => r.name === roleName);
     const color = this.getCallRoleColor(hours);
 
     if (role) {
       if (role.color !== color) {
-        await role.edit({ color, reason: 'Sincronizar cor do cargo de call' }).catch(() => {});
+        await role.edit({ color, reason: "Sincronizar cor do cargo de call" }).catch(() => {});
       }
       return role;
     }
 
-    return guild.roles.create({
-      name: roleName,
-      color,
-      reason: 'Cargo automático por horas em call',
-    }).catch(() => null);
+    return guild.roles
+      .create({
+        name: roleName,
+        color,
+        reason: "Cargo automático por horas em call",
+      })
+      .catch(() => null);
   }
 
   async updateMemberCallLevelRole(guild, userId) {
     const member = await guild.members.fetch(userId).catch(() => null);
 
-    // ✅ permite Lynn Bot
+    // ✅ permite o próprio bot
     if (!member || !this.isTrackableUser(member.user)) return;
 
-    const totalMs = await this.getTotalWithLiveMs(userId);
+    const totalMs = await this.getTotalWithLiveMs(guild.id, userId);
     const hours = totalMs / 3600000;
     const roleData = this.getCallLevelRoleDataFromHours(hours);
 
-    const currentCallRoles = member.roles.cache.filter(r => this.isCallLevelRoleName(r.name));
+    const currentCallRoles = member.roles.cache.filter((r) => this.isCallLevelRoleName(r.name));
 
     if (!roleData) {
-      if (currentCallRoles.size > 0) {
-        await member.roles.remove(currentCallRoles).catch(() => {});
-      }
+      if (currentCallRoles.size > 0) await member.roles.remove(currentCallRoles).catch(() => {});
       return;
     }
 
@@ -441,28 +392,24 @@ class CallRankingManager {
     const targetRole = await this.ensureCallRole(guild, targetRoleName, roleData.milestone);
     if (!targetRole) return;
 
-    const toRemove = currentCallRoles.filter(r => r.id !== targetRole.id);
-    if (toRemove.size > 0) {
-      await member.roles.remove(toRemove).catch(() => {});
-    }
+    const toRemove = currentCallRoles.filter((r) => r.id !== targetRole.id);
+    if (toRemove.size > 0) await member.roles.remove(toRemove).catch(() => {});
 
     if (!member.roles.cache.has(targetRole.id)) {
-      await member.roles.add(targetRole, 'Cargo automático por horas em call').catch(() => {});
+      await member.roles.add(targetRole, "Cargo automático por horas em call").catch(() => {});
     }
   }
 
-  async updateAllCallLevelRoles() {
-    if (!this.targetGuildId) return;
-
-    const guild = await this.client.guilds.fetch(this.targetGuildId).catch(() => null);
+  async updateAllCallLevelRolesForGuild(guildId) {
+    const guild = await this.client.guilds.fetch(String(guildId)).catch(() => null);
     if (!guild) return;
 
-    const rows = await this.all(`SELECT user_id FROM call_users`);
+    const rows = await this.all(`SELECT user_id FROM call_users WHERE guild_id = ?`, [String(guildId)]);
     for (const row of rows) {
       try {
         await this.updateMemberCallLevelRole(guild, row.user_id);
       } catch (err) {
-        console.error(`[CallRanking] Erro ao atualizar cargo de ${row.user_id}:`, err);
+        console.error(`[CallRanking] Erro ao atualizar cargo de ${row.user_id} em ${guildId}:`, err);
       }
     }
   }
@@ -494,14 +441,17 @@ class CallRankingManager {
 
     const elapsed = Math.max(0, Date.now() - startedAt);
 
-    const existing = await this.get(`SELECT username FROM call_users WHERE user_id = ?`, [String(userId)]);
+    const existing = await this.get(
+      `SELECT username FROM call_users WHERE guild_id = ? AND user_id = ?`,
+      [String(guildId), String(userId)]
+    );
     const username = existing?.username || `ID ${userId}`;
 
     await this.run(
-      `INSERT INTO call_users (user_id, username, total_ms)
-       VALUES (?, ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET total_ms = total_ms + excluded.total_ms`,
-      [String(userId), username, elapsed]
+      `INSERT INTO call_users (guild_id, user_id, username, total_ms)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(guild_id, user_id) DO UPDATE SET total_ms = total_ms + excluded.total_ms`,
+      [String(guildId), String(userId), username, elapsed]
     );
 
     await this.run(`DELETE FROM call_sessions WHERE session_key = ?`, [k]);
@@ -510,14 +460,14 @@ class CallRankingManager {
   async restoreActiveSessionsFromDb() {
     const rows = await this.all(`SELECT session_key, started_at FROM call_sessions`);
     for (const row of rows) {
-      this.activeSessions.set(row.session_key, Number(row.started_at));
+      this.activeSessions.set(String(row.session_key), Number(row.started_at));
     }
   }
 
   async handleVoiceStateUpdate(oldState, newState) {
     const member = newState.member || oldState.member;
 
-    // ✅ Lynn Bot conta; outros bots não
+    // ✅ seu bot conta; outros bots não
     if (!member || !this.isTrackableUser(member.user)) return;
 
     const guildId = newState.guild?.id || oldState.guild?.id;
@@ -527,7 +477,7 @@ class CallRankingManager {
     const wasIn = !!oldState.channelId;
     const isIn = !!newState.channelId;
 
-    await this.touchUser(member.user);
+    await this.touchUser(guildId, member.user);
 
     if (!wasIn && isIn) {
       await this.startSession(guildId, userId);
@@ -543,94 +493,263 @@ class CallRankingManager {
   }
 
   // =========================
-  // EMBED / RANKING
+  // EMBED / RANKING (por guild)
   // =========================
   async buildEmbed(guild) {
-    const rows = await this.all(`SELECT user_id, total_ms FROM call_users`);
+    const rows = await this.all(
+      `SELECT user_id, total_ms FROM call_users WHERE guild_id = ?`,
+      [String(guild.id)]
+    );
 
     const ranking = rows
-      .map(row => ({
+      .map((row) => ({
         userId: row.user_id,
-        totalMs: Number(row.total_ms || 0) + this.getLiveMs(row.user_id),
+        totalMs: Number(row.total_ms || 0) + this.getLiveMs(guild.id, row.user_id),
       }))
       .sort((a, b) => b.totalMs - a.totalMs);
 
     const top = ranking.slice(0, 15);
 
     const lines = top.length
-      ? top.map((u, i) => {
-          const pos =
-            i === 0 ? '🥇' :
-            i === 1 ? '🥈' :
-            i === 2 ? '🥉' :
-            `\`${String(i + 1).padStart(2, '0')}\``;
+      ? top
+          .map((u, i) => {
+            const pos =
+              i === 0 ? "🥇" :
+              i === 1 ? "🥈" :
+              i === 2 ? "🥉" :
+              `\`${String(i + 1).padStart(2, "0")}\``;
 
-          return `${pos} <@${u.userId}> — **${this.formatMs(u.totalMs)}**`;
-        }).join('\n')
-      : 'Ninguém entrou em call ainda.';
+            return `${pos} <@${u.userId}> — **${this.formatMs(u.totalMs)}**`;
+          })
+          .join("\n")
+      : "Ninguém entrou em call ainda.";
 
-    const onlineNow = [...this.activeSessions.keys()]
-      .filter(k => k.startsWith(`${guild.id}:`)).length;
+    const onlineNow = [...this.activeSessions.keys()].filter((k) => k.startsWith(`${guild.id}:`)).length;
 
-    const lastUpdate = new Date().toLocaleString('pt-BR', {
-      timeZone: 'America/Sao_Paulo',
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
+    const lastUpdate = new Date().toLocaleString("pt-BR", {
+      timeZone: "America/Sao_Paulo",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
     });
 
     return new EmbedBuilder()
-      .setTitle('📞 Ranking de Horas em Call')
-      .setColor('#0099ff')
+      .setTitle("📞 Ranking de Horas em Call")
+      .setColor("#0099ff")
       .setDescription(`### 🏆 Top membros em call\n\n${lines}`)
       .addFields(
-        { name: '👥 Em call agora', value: `**${onlineNow}** membro(s)`, inline: true },
-        { name: '🔄 Atualização', value: 'A cada **5 minutos**', inline: true },
-        { name: '🕒 Última atualização', value: lastUpdate, inline: false },
+        { name: "👥 Em call agora", value: `**${onlineNow}** membro(s)`, inline: true },
+        { name: "🔄 Atualização", value: "A cada **5 minutos**", inline: true },
+        { name: "🕒 Última atualização", value: lastUpdate, inline: false }
       )
-      .setFooter({ text: 'Desenvolvido por Lynn' })
+      .setFooter({ text: "Desenvolvido por Lynn" })
       .setTimestamp();
   }
 
   // =========================
-  // MENSAGEM DO RANKING
+  // MENSAGEM DO RANKING (por guild)
   // =========================
-  async updateRankingMessage() {
-    if (!this.targetGuildId || !this.targetChannelId) return;
+  async updateRankingMessageForTarget(target) {
+    const guildId = String(target.guildId);
+    const channelId = String(target.channelId);
 
-    const guild = await this.client.guilds.fetch(this.targetGuildId).catch(() => null);
+    const guild = await this.client.guilds.fetch(guildId).catch(() => null);
     if (!guild) return;
 
-    const channel = await guild.channels.fetch(this.targetChannelId).catch(() => null);
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
     if (!channel || !channel.isTextBased?.()) return;
 
     const embed = await this.buildEmbed(guild);
 
+    // garante que a meta desta guild esteja carregada
+    if (!this.cache.rankingMessageIds.has(guildId)) {
+      await this.loadMetaForGuild(guildId);
+    }
+
+    const storedMsgId = this.cache.rankingMessageIds.get(guildId) || null;
+
     let msg = null;
-    if (this.cache.rankingMessageId) {
-      msg = await channel.messages.fetch(this.cache.rankingMessageId).catch(() => null);
+    if (storedMsgId) {
+      // Se faltar "Read Message History", aqui pode falhar e você vai reenviar toda vez.
+      msg = await channel.messages.fetch(storedMsgId).catch(() => null);
     }
 
     if (msg) {
-      await msg.edit({ embeds: [embed] }).catch(err => {
-        console.error('[CallRanking] Erro ao editar mensagem:', err);
+      await msg.edit({ embeds: [embed] }).catch((err) => {
+        console.error(`[CallRanking] Erro ao editar mensagem (${guildId}):`, err);
       });
-    } else {
-      const newMsg = await channel.send({ embeds: [embed] }).catch(err => {
-        console.error('[CallRanking] Erro ao enviar mensagem:', err);
-        return null;
-      });
-
-      if (newMsg) {
-        await this.setMeta('rankingMessageId', newMsg.id);
-      }
+      return;
     }
 
-    await this.updateAllCallLevelRoles().catch(err => {
-      console.error('[CallRanking] Erro ao sincronizar cargos de call:', err);
+    // Se não encontrou a msg antiga (apagada, permissão, id errado) -> envia nova e salva
+    const newMsg = await channel.send({ embeds: [embed] }).catch((err) => {
+      console.error(`[CallRanking] Erro ao enviar mensagem (${guildId}):`, err);
+      return null;
     });
+
+    if (newMsg) {
+      await this.setRankingMessageId(guildId, newMsg.id);
+    }
+  }
+
+  async updateRankingMessages() {
+    const targets = this.getTargets();
+    if (!targets.length) return;
+
+    for (const t of targets) {
+      await this.updateRankingMessageForTarget(t);
+      // cargos por guild (só onde você posta ranking)
+      await this.updateAllCallLevelRolesForGuild(t.guildId).catch((err) => {
+        console.error(`[CallRanking] Erro ao sincronizar cargos em ${t.guildId}:`, err);
+      });
+    }
+  }
+
+  // =========================
+  // SNAPSHOT / BACKUP
+  // =========================
+  async exportCurrentDataAsJsonObject() {
+    const rows = await this.all(`SELECT guild_id, user_id, username, total_ms FROM call_users`);
+    const usersByGuild = {};
+
+    for (const row of rows) {
+      const gid = String(row.guild_id);
+      if (!usersByGuild[gid]) usersByGuild[gid] = {};
+      usersByGuild[gid][row.user_id] = {
+        username: row.username || `ID ${row.user_id}`,
+        totalMs: Number(row.total_ms || 0),
+      };
+    }
+
+    // salva também messageIds por guild
+    const rankingMessageIds = {};
+    for (const [gid, mid] of this.cache.rankingMessageIds.entries()) {
+      rankingMessageIds[gid] = mid;
+    }
+
+    return { usersByGuild, rankingMessageIds };
+  }
+
+  async createSnapshotBackup() {
+    try {
+      this.ensureStorage();
+
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      const filename = `call_ranking.snapshot.${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
+      const snapshotPath = path.join(this.dataDir, filename);
+
+      const json = await this.exportCurrentDataAsJsonObject();
+      fs.writeFileSync(snapshotPath, JSON.stringify(json, null, 2));
+
+      this.lastSnapshotAt = Date.now();
+      console.log(`[CallRanking] Snapshot criado: ${filename}`);
+
+      this.cleanupOldSnapshots(10);
+    } catch (err) {
+      console.error("[CallRanking] Erro ao criar snapshot backup:", err);
+    }
+  }
+
+  cleanupOldSnapshots(keep = 10) {
+    try {
+      const files = fs
+        .readdirSync(this.dataDir)
+        .filter((name) => name.startsWith("call_ranking.snapshot.") && name.endsWith(".json"))
+        .map((name) => ({
+          name,
+          fullPath: path.join(this.dataDir, name),
+          mtime: fs.statSync(path.join(this.dataDir, name)).mtimeMs,
+        }))
+        .sort((a, b) => b.mtime - a.mtime);
+
+      for (const file of files.slice(keep)) {
+        fs.unlinkSync(file.fullPath);
+        console.log(`[CallRanking] Snapshot antigo removido: ${file.name}`);
+      }
+    } catch (err) {
+      console.warn("[CallRanking] Falha ao limpar snapshots antigos:", err?.message || err);
+    }
+  }
+
+  async createManualBackupPayload() {
+    const data = await this.exportCurrentDataAsJsonObject();
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+
+    const fileName = `call_ranking_backup_${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
+
+    return {
+      fileName,
+      buffer: Buffer.from(JSON.stringify(data, null, 2), "utf8"),
+      data,
+    };
+  }
+
+  // =========================
+  // IMPORT LEGADO (opcional)
+  // =========================
+  readLegacyJsonSafe(filePath) {
+    try {
+      if (!fs.existsSync(filePath)) return null;
+      const raw = fs.readFileSync(filePath, "utf8");
+      const json = JSON.parse(raw);
+      if (!json || typeof json !== "object") return null;
+      return json;
+    } catch (err) {
+      console.warn(`[CallRanking] Falha ao ler JSON legado (${path.basename(filePath)}):`, err?.message || err);
+      return null;
+    }
+  }
+
+  async countUsersInDb() {
+    const row = await this.get(`SELECT COUNT(*) AS count FROM call_users`);
+    return Number(row?.count || 0);
+  }
+
+  /**
+   * AVISO: o legado não tem guild_id, então não dá pra separar Cave vs Yakuza.
+   * Se você tiver que importar, ele vai colocar tudo em UM guild escolhido.
+   * Para evitar sujeira, o recomendado é NÃO importar e começar “limpo”.
+   */
+  async autoImportLegacyJsonIfNeeded() {
+    const dbUserCount = await this.countUsersInDb();
+    if (dbUserCount > 0) return;
+
+    const legacy =
+      this.readLegacyJsonSafe(this.legacyJsonPath) ||
+      this.readLegacyJsonSafe(this.legacyBackupJsonPath);
+
+    if (!legacy) return;
+
+    // Se existir, escolhe o primeiro target como destino
+    const targets = this.getTargets();
+    const defaultGuildId = targets?.[0]?.guildId || null;
+
+    if (!defaultGuildId) {
+      console.warn("[CallRanking] Existe JSON legado, mas não há CALL_RANKING_TARGETS/IDs definidos. Ignorando import.");
+      return;
+    }
+
+    const entries = Object.entries(legacy.users || {});
+    if (!entries.length) return;
+
+    for (const [userId, info] of entries) {
+      const username = info?.username || `ID ${userId}`;
+      const totalMs = Number(info?.totalMs || 0);
+
+      await this.run(
+        `INSERT INTO call_users (guild_id, user_id, username, total_ms)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(guild_id, user_id) DO UPDATE SET username = excluded.username, total_ms = excluded.total_ms`,
+        [String(defaultGuildId), String(userId), username, totalMs]
+      );
+    }
+
+    await this.setMeta("legacyJsonImportedAt", String(Date.now()));
+    console.log(`[CallRanking] Import legado concluído (${entries.length} usuários) => guild ${defaultGuildId}.`);
   }
 
   // =========================
@@ -641,34 +760,40 @@ class CallRankingManager {
 
     await this.openDb();
     await this.initDbSchema();
+
+    // (opcional) import legado
     await this.autoImportLegacyJsonIfNeeded();
-    await this.loadMeta();
+
+    // restaura sessões ativas do db
     await this.restoreActiveSessionsFromDb();
 
-    // captura quem já está em call ao ligar (inclui Lynn Bot)
+    // captura quem já está em call ao ligar
     for (const guild of this.client.guilds.cache.values()) {
       for (const voiceState of guild.voiceStates.cache.values()) {
-        if (voiceState.channelId && voiceState.member && this.isTrackableUser(voiceState.member.user)) {
-          await this.touchUser(voiceState.member.user);
+        if (!voiceState.channelId || !voiceState.member) continue;
+        if (!this.isTrackableUser(voiceState.member.user)) continue;
 
-          const k = this.key(guild.id, voiceState.id);
-          if (!this.activeSessions.has(k)) {
-            await this.startSession(guild.id, voiceState.id);
-          }
+        await this.touchUser(guild.id, voiceState.member.user);
+
+        const k = this.key(guild.id, voiceState.id);
+        if (!this.activeSessions.has(k)) {
+          await this.startSession(guild.id, voiceState.id);
         }
       }
     }
 
-    await this.updateRankingMessage().catch(err => {
-      console.error('[CallRanking] Erro na atualização inicial:', err);
+    // atualização inicial
+    await this.updateRankingMessages().catch((err) => {
+      console.error("[CallRanking] Erro na atualização inicial:", err);
     });
 
+    // snapshot inicial
     await this.createSnapshotBackup();
 
     if (this.interval) clearInterval(this.interval);
     this.interval = setInterval(() => {
-      this.updateRankingMessage().catch(err => {
-        console.error('[CallRanking] Erro na atualização periódica:', err);
+      this.updateRankingMessages().catch((err) => {
+        console.error("[CallRanking] Erro na atualização periódica:", err);
       });
     }, this.updateIntervalMs);
 
