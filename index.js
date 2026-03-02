@@ -3,6 +3,9 @@ require("dotenv").config();
 const fs = require("node:fs");
 const path = require("node:path");
 
+// libsodium (corrige erro "No compatible encryption modes")
+const libsodium = require("libsodium-wrappers");
+
 const {
   Client,
   Collection,
@@ -38,9 +41,12 @@ if (!TOKEN) {
   process.exit(1);
 }
 
+// Se TRUE, contabiliza o bot no ranking quando ele fica 24/7 em call.
+// Por padrão: NÃO (pra não sujar ranking)
+const COUNT_BOT_IN_RANKING = String(process.env.COUNT_BOT_IN_RANKING || "false").toLowerCase() === "true";
+
 /**
  * Config 24/7 por servidor.
- * Você pode “apelidar” aqui (name) para logs mais claros.
  */
 const AUTO_247 = [
   {
@@ -183,23 +189,11 @@ async function ensure247Voice(guildId) {
     }
   }
 
+  // Se já existe conexão no canal correto, não faz nada
   const existing = getVoiceConnection(guild.id);
-  if (existing?.joinConfig?.channelId === cfg.channelId) {
-    // já está no canal correto
-    // garante contagem do bot no ranking (por guild) se você quiser manter
-    try {
-      if (client.callRanking && client.user) {
-        await client.callRanking.touchUser(client.user);
-        await client.callRanking.startSession(guild.id, client.user.id);
-        await client.callRanking.updateRankingMessage().catch(() => {});
-      }
-    } catch (e) {
-      console.error(`❌ [24/7:${cfg.guildName}] Erro ao garantir sessão do bot no ranking:`, e);
-    }
-    return;
-  }
+  if (existing?.joinConfig?.channelId === cfg.channelId) return;
 
-  // se existe conexão em outro canal dentro da mesma guild, destrói e recria
+  // se existe conexão em outro canal na mesma guild, destrói e recria
   if (existing) {
     try {
       existing.destroy();
@@ -207,6 +201,10 @@ async function ensure247Voice(guildId) {
   }
 
   try {
+    // libsodium precisa estar pronto ANTES de conectar em voz
+    await libsodium.ready;
+    global.sodium = libsodium;
+
     const connection = joinVoiceChannel({
       channelId: channel.id,
       guildId: guild.id,
@@ -217,15 +215,15 @@ async function ensure247Voice(guildId) {
 
     await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
 
-    // Contabiliza a sessão do bot (se você quiser que o bot conte no ranking do servidor)
-    try {
-      if (client.callRanking && client.user) {
-        await client.callRanking.touchUser(client.user);
+    // Se você quiser que o bot conte no ranking, habilite COUNT_BOT_IN_RANKING=true
+    if (COUNT_BOT_IN_RANKING && client.callRanking && client.user) {
+      try {
+        await client.callRanking.touchUser(guild.id, client.user);
         await client.callRanking.startSession(guild.id, client.user.id);
         await client.callRanking.updateRankingMessage().catch(() => {});
+      } catch (e) {
+        console.error(`❌ [24/7:${cfg.guildName}] Erro ao registrar sessão do bot no ranking:`, e);
       }
-    } catch (e) {
-      console.error(`❌ [24/7:${cfg.guildName}] Erro ao registrar sessão do bot no ranking:`, e);
     }
 
     connection.on("stateChange", (_oldState, newState) => {
@@ -352,6 +350,10 @@ client.once(Events.ClientReady, async () => {
 
   // init sistemas
   try {
+    // libsodium ready cedo
+    await libsodium.ready;
+    global.sodium = libsodium;
+
     await client.licenses.init();
     console.log("✅ Sistema de licenças inicializado");
 
@@ -377,7 +379,7 @@ client.once(Events.ClientReady, async () => {
 // =====================
 client.on("interactionCreate", async (interaction) => {
   try {
-    if (interaction.isCommand()) {
+    if (interaction.isChatInputCommand()) {
       const command = client.commands.get(interaction.commandName);
       if (!command) return;
 
@@ -469,18 +471,16 @@ client.on("interactionCreate", async (interaction) => {
 // VOICE STATE UPDATE (ranking + auto-247)
 // =====================
 client.on("voiceStateUpdate", async (oldState, newState) => {
-  // 1) Ranking (por guild) — isso já garante que Cave e Yakuza são competições separadas.
+  // 1) Ranking (por guild)
   try {
-    client.callRanking?.handleVoiceStateUpdate(oldState, newState);
+    await client.callRanking?.handleVoiceStateUpdate(oldState, newState);
   } catch (err) {
     console.error("Erro no voiceStateUpdate do ranking:", err);
   }
 
-  // 2) Auto-247 apenas para as guilds configuradas
+  // 2) Auto-247 apenas para as guilds configuradas (somente para o BOT)
   try {
     if (!client.user) return;
-
-    // Só nos interessa se o evento é do PRÓPRIO BOT
     if (newState.id !== client.user.id) return;
 
     const guildId = oldState.guild?.id || newState.guild?.id;
@@ -490,28 +490,26 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     const oldChannelId = oldState.channelId;
     const newChannelId = newState.channelId;
 
-    // Se saiu do canal alvo, encerra sessão do bot (por guild) e reagenda reconexão
     if (oldChannelId === cfg.channelId && newChannelId !== cfg.channelId) {
-      try {
-        if (client.callRanking && client.user) {
+      // se você contabiliza bot no ranking, encerra sessão
+      if (COUNT_BOT_IN_RANKING && client.callRanking && client.user) {
+        try {
           await client.callRanking.stopSession(guildId, client.user.id);
           await client.callRanking.updateRankingMessage().catch(() => {});
+        } catch (e) {
+          console.error(`Erro ao encerrar sessão do bot no ranking [${cfg.guildName}]:`, e);
         }
-      } catch (e) {
-        console.error(`Erro ao encerrar sessão do bot no ranking [${cfg.guildName}]:`, e);
       }
 
       scheduleReconnect(guildId, "foi removida/movida");
       return;
     }
 
-    // Se entrou em um canal diferente do alvo, tenta voltar pro alvo
     if (newChannelId && newChannelId !== cfg.channelId) {
       scheduleReconnect(guildId, "entrou em canal diferente");
       return;
     }
 
-    // Se ficou sem canal (desconectado)
     if (!newChannelId && oldChannelId) {
       scheduleReconnect(guildId, "desconectado");
       return;
