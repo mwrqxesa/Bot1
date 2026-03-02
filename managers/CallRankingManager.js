@@ -1,29 +1,3 @@
-/**
- * CallRankingManager (REFEITO)
- *
- * ✅ Separa ranking por servidor (guild_id + user_id)
- * ✅ Nunca mistura Cave com Yakuza
- * ✅ Atualiza a MESMA mensagem (edit), não fica reenviando
- * ✅ Suporta 1 ou múltiplos rankings (targets) via env
- * ✅ Mantém sessões ativas (call_sessions) por guild
- * ✅ Snapshot/backup inclui dados por guild
- *
- * IMPORTANTE sobre “reenviar toda vez”:
- * - Se o bot NÃO tiver permissão "Read Message History" no canal do ranking,
- *   ele não consegue buscar a mensagem antiga para editar e vai enviar outra nova.
- *   Garanta no canal do ranking:
- *   ✅ View Channel, Send Messages, Embed Links, Read Message History
- *
- * ENV suportadas:
- * - CALL_RANKING_TARGETS (recomendado): JSON
- *   Exemplo:
- *   CALL_RANKING_TARGETS=[{"guildId":"1237058787093905510","channelId":"SEU_CANAL_RANKING_YAKUZA"}]
- *
- * - Fallback (se não usar JSON):
- *   CALL_RANKING_GUILD_ID=...
- *   CALL_RANKING_CHANNEL_ID=...
- */
-
 const fs = require("node:fs");
 const path = require("node:path");
 const { EmbedBuilder } = require("discord.js");
