@@ -1,135 +1,100 @@
-const {
-  SlashCommandBuilder,
-  PermissionFlagsBits,
-} = require("discord.js");
+const { SlashCommandBuilder, PermissionFlagsBits } = require("discord.js");
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName("horas")
-    .setDescription("Gerencia ranking de horas em call")
-    // opcional: restringir só admins
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .setDescription("Sistema de horas em call (Yakuza).")
+    .addSubcommand((sub) =>
+      sub
+        .setName("ver")
+        .setDescription("Ver horas de um usuário.")
+        .addUserOption((opt) =>
+          opt.setName("usuario").setDescription("Usuário para consultar.").setRequired(false)
+        )
+    )
     .addSubcommand((sub) =>
       sub
         .setName("transferir")
-        .setDescription("Transfere X horas (ms) do usuário origem para o destino")
+        .setDescription("Transferir horas/minutos de uma pessoa para outra.")
         .addUserOption((opt) =>
-          opt
-            .setName("origem")
-            .setDescription("Quem vai perder as horas")
-            .setRequired(true)
+          opt.setName("de").setDescription("Quem vai transferir.").setRequired(true)
         )
         .addUserOption((opt) =>
-          opt
-            .setName("destino")
-            .setDescription("Quem vai receber as horas")
-            .setRequired(true)
+          opt.setName("para").setDescription("Quem vai receber.").setRequired(true)
         )
         .addNumberOption((opt) =>
           opt
-            .setName("horas")
-            .setDescription("Quantidade de horas para transferir (ex: 10 ou 10.5)")
+            .setName("quantidade")
+            .setDescription("Quantidade (ex: 2.5 ou 150).")
             .setRequired(true)
             .setMinValue(0.01)
         )
-    ),
+        .addStringOption((opt) =>
+          opt
+            .setName("unidade")
+            .setDescription("Escolha se a quantidade é horas ou minutos.")
+            .setRequired(true)
+            .addChoices(
+              { name: "horas", value: "hours" },
+              { name: "minutos", value: "minutes" }
+            )
+        )
+    )
+    // 🔒 recomendo admin only
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   async execute(interaction) {
-    try {
-      const origem = interaction.options.getUser("origem", true);
-      const destino = interaction.options.getUser("destino", true);
-      const horas = interaction.options.getNumber("horas", true);
+    const cr = interaction.client.callRanking;
 
-      if (origem.id === destino.id) {
-        return interaction.reply({ content: "❌ Origem e destino não podem ser o mesmo usuário.", ephemeral: true });
-      }
+    if (!cr?.enabled) {
+      return interaction.reply({ content: "❌ Ranking/DB não está ativo agora.", ephemeral: true });
+    }
 
-      // se quiser fixar só na Yakuza, descomente:
-      // if (interaction.guildId !== process.env.CALL_RANKING_GUILD_ID) {
-      //   return interaction.reply({ content: "❌ Esse comando só funciona no servidor configurado.", ephemeral: true });
-      // }
+    // ✅ trava pra Yakuza (igual seu ranking)
+    if (String(interaction.guildId) !== String(cr.targetGuildId)) {
+      return interaction.reply({
+        content: "❌ Este comando só pode ser usado na **Yakuza**.",
+        ephemeral: true,
+      });
+    }
 
-      const guildId = String(interaction.guildId);
-      const ms = Math.round(horas * 60 * 60 * 1000);
+    const sub = interaction.options.getSubcommand();
 
-      // ✅ Pega o Pool do seu CallRankingManager (veja passo 2)
-      const pool = interaction.client.callRanking?.pool;
-      if (!pool) {
+    if (sub === "ver") {
+      const user = interaction.options.getUser("usuario") || interaction.user;
+      const ms = await cr.getUserTotalMs(interaction.guildId, user.id);
+      const hours = ms / 1000 / 60 / 60;
+
+      return interaction.reply({
+        content: `⏱️ <@${user.id}> tem **${hours.toFixed(2)} horas** (**${cr.formatMs(ms)}**) em call (Yakuza).`,
+        ephemeral: false,
+      });
+    }
+
+    if (sub === "transferir") {
+      const fromUser = interaction.options.getUser("de");
+      const toUser = interaction.options.getUser("para");
+      const quantidade = interaction.options.getNumber("quantidade");
+      const unidade = interaction.options.getString("unidade");
+
+      try {
+        const ms = await cr.transferTime(interaction.guildId, fromUser, toUser, quantidade, unidade);
+
+        // atualiza embed logo após
+        await cr.updateRankingMessage().catch(() => {});
+
         return interaction.reply({
-          content: "❌ Banco não inicializado (pool null). Verifique se o CallRankingManager conectou no Neon.",
+          content:
+            `✅ Transferido **${cr.formatMs(ms)}** de ${fromUser} para ${toUser}.\n` +
+            `📌 Unidade: **${unidade === "minutes" ? "minutos" : "horas"}** (${quantidade})`,
+          ephemeral: false,
+        });
+      } catch (e) {
+        return interaction.reply({
+          content: `❌ Falha ao transferir: ${e?.message || e}`,
           ephemeral: true,
         });
       }
-
-      await interaction.deferReply({ ephemeral: true });
-
-      // Transação segura
-      await pool.query("BEGIN");
-
-      // garante que ambos existem
-      await pool.query(
-        `INSERT INTO call_users (guild_id, user_id, username, total_ms)
-         VALUES ($1,$2,$3,0)
-         ON CONFLICT (guild_id, user_id) DO UPDATE SET username = EXCLUDED.username`,
-        [guildId, String(origem.id), origem.username]
-      );
-
-      await pool.query(
-        `INSERT INTO call_users (guild_id, user_id, username, total_ms)
-         VALUES ($1,$2,$3,0)
-         ON CONFLICT (guild_id, user_id) DO UPDATE SET username = EXCLUDED.username`,
-        [guildId, String(destino.id), destino.username]
-      );
-
-      // checa saldo
-      const res = await pool.query(
-        `SELECT total_ms FROM call_users WHERE guild_id = $1 AND user_id = $2`,
-        [guildId, String(origem.id)]
-      );
-      const origemMs = Number(res.rows?.[0]?.total_ms || 0);
-
-      if (origemMs < ms) {
-        await pool.query("ROLLBACK");
-        return interaction.editReply(
-          `❌ ${origem} não tem horas suficientes.\n` +
-          `Disponível: ${(origemMs / 3600000).toFixed(2)}h | Tentou transferir: ${horas}h`
-        );
-      }
-
-      // soma no destino
-      await pool.query(
-        `UPDATE call_users
-         SET total_ms = total_ms + $1
-         WHERE guild_id = $2 AND user_id = $3`,
-        [ms, guildId, String(destino.id)]
-      );
-
-      // subtrai da origem
-      await pool.query(
-        `UPDATE call_users
-         SET total_ms = total_ms - $1
-         WHERE guild_id = $2 AND user_id = $3`,
-        [ms, guildId, String(origem.id)]
-      );
-
-      await pool.query("COMMIT");
-
-      // (opcional) forçar update do ranking na hora
-      if (interaction.client.callRanking?.updateRankingMessage) {
-        interaction.client.callRanking.updateRankingMessage().catch(() => {});
-      }
-
-      return interaction.editReply(
-        `✅ Transferido **${horas}h** (${ms} ms)\n` +
-        `De: ${origem}\nPara: ${destino}`
-      );
-    } catch (err) {
-      try {
-        const pool = interaction.client.callRanking?.pool;
-        if (pool) await pool.query("ROLLBACK");
-      } catch {}
-      console.error("Erro /horas transferir:", err);
-      return interaction.reply({ content: "❌ Erro ao transferir horas. Veja os logs.", ephemeral: true });
     }
   },
 };
