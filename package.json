@@ -16,11 +16,8 @@
     "libsodium-wrappers": "^0.7.13",
     "node-cron": "^3.0.3",
     "node-fetch": "^2.7.0",
-<<<<<<< HEAD
+    "pg": "^8.19.0",
     "sqlite3": "^5.1.7"
-=======
-    "pg": "^8.19.0"
->>>>>>> be60995 (add pg dependency for neon)
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
