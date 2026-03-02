@@ -7,47 +7,72 @@ class CallRankingManager {
   constructor(client) {
     this.client = client;
 
-    // ✅ Agora o banco é Neon/Postgres
+    // ====== CONFIG ======
+    // Neon/Postgres
     this.databaseUrl = process.env.DATABASE_URL || null;
     this.pool = null;
 
-    // (Opcional) snapshots em JSON local — útil se você roda no PC/VPS.
-    // Em Railway, arquivos podem não persistir; Neon já é a persistência real.
-    this.dataDir = path.join(__dirname, "..", "data");
+    // ✅ Ranking somente na Yakuza (fixo)
+    // Você já passou:
+    // Guild: 1476212383109087304
+    // Msg:   1477465092470608015
+    this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || "1476212383109087304";
+    this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || "1476212383109087304"; // ⚠️ troque pelo ID do CANAL correto se este não for o canal
+    this.targetMessageId = process.env.CALL_RANKING_MESSAGE_ID || "1477465092470608015";
 
-    this.activeSessions = new Map(); // session_key(guild:user) => startedAt
+    // Intervalos
     this.updateIntervalMs = 5 * 60 * 1000; // 5 min
+    this.snapshotBackupIntervalMs = 10 * 60 * 60 * 1000; // 10h (opcional)
 
-    this.snapshotBackupIntervalMs = 10 * 60 * 60 * 1000; // 10h
-    this.snapshotInterval = null;
-    this.lastSnapshotAt = 0;
-
+    // ====== STATE ======
+    this.activeSessions = new Map(); // key(guild:user) => startedAt(ms)
     this.interval = null;
+    this.snapshotInterval = null;
 
-    // ✅ Ranking SOMENTE na Yakuza (fixo) e SEMPRE edita a mesma msg
-    this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || null;
-    this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null;
-    this.targetMessageId = process.env.CALL_RANKING_MESSAGE_ID || null;
+    // ✅ “modo seguro”: se banco falhar, não spamma erro em voiceStateUpdate
+    this.enabled = false;
+
+    // snapshots locais (opcional)
+    this.dataDir = path.join(__dirname, "..", "data");
   }
 
   // =========================
-  // FS (opcional: snapshots)
+  // Storage (snapshots)
   // =========================
   ensureStorage() {
-    if (!fs.existsSync(this.dataDir)) {
-      fs.mkdirSync(this.dataDir, { recursive: true });
-    }
+    if (!fs.existsSync(this.dataDir)) fs.mkdirSync(this.dataDir, { recursive: true });
   }
 
   // =========================
-  // DB helpers (Postgres)
+  // DB
   // =========================
+  async connectDb() {
+    if (!this.databaseUrl) {
+      console.error("❌ [CallRanking] DATABASE_URL não definida.");
+      return false;
+    }
+
+    // ✅ Força SSL no Node/pg (Neon costuma exigir).
+    // Mesmo que sua URL tenha sslmode=require, isso ajuda a evitar dor de cabeça.
+    this.pool = new Pool({
+      connectionString: this.databaseUrl,
+      ssl: { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 15_000,
+    });
+
+    // testa conexão
+    await this.pool.query("SELECT 1");
+    return true;
+  }
+
   async query(sql, params = []) {
+    if (!this.pool) throw new Error("DB pool not initialized");
     return this.pool.query(sql, params);
   }
 
   async initDbSchema() {
-    // ✅ totals por guild + user (NUNCA mistura servidores)
     await this.query(`
       CREATE TABLE IF NOT EXISTS call_users (
         guild_id TEXT NOT NULL,
@@ -72,25 +97,22 @@ class CallRankingManager {
   }
 
   // =========================
-  // TRACK RULES (permite seu bot)
+  // Track rules
   // =========================
   isTrackableUser(user) {
     if (!user) return false;
-
-    // ✅ Permite o próprio bot
+    // ✅ permite o próprio bot (para seu 24/7 se você quiser contar)
     if (this.client?.user && user.id === this.client.user.id) return true;
-
-    // ❌ Ignora outros bots
+    // ❌ ignora outros bots
     if (user.bot) return false;
-
     return true;
   }
 
   // =========================
-  // HELPERS
+  // Helpers
   // =========================
   key(guildId, userId) {
-    return `${guildId}:${userId}`;
+    return `${String(guildId)}:${String(userId)}`;
   }
 
   formatMs(ms) {
@@ -100,10 +122,20 @@ class CallRankingManager {
     return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
   }
 
+  getLiveMs(guildId, userId) {
+    const gid = String(guildId);
+    const uid = String(userId);
+    const k = `${gid}:${uid}`;
+    const startedAt = this.activeSessions.get(k);
+    if (!startedAt) return 0;
+    return Math.max(0, Date.now() - startedAt);
+  }
+
   // =========================
-  // USERS / TOTALS (por guild)
+  // Users / totals
   // =========================
   async touchUser(guildId, user) {
+    if (!this.enabled) return;
     if (!this.isTrackableUser(user)) return;
 
     await this.query(
@@ -117,24 +149,12 @@ class CallRankingManager {
     );
   }
 
-  getLiveMs(guildId, userId) {
-    let total = 0;
-    const prefix = `${String(guildId)}:`;
-    const uid = String(userId);
-
-    for (const [k, startedAt] of this.activeSessions.entries()) {
-      if (!k.startsWith(prefix)) continue;
-      const [, kUserId] = k.split(":");
-      if (kUserId === uid) total += Date.now() - startedAt;
-    }
-
-    return total;
-  }
-
   // =========================
-  // SESSÕES
+  // Sessions
   // =========================
   async startSession(guildId, userId) {
+    if (!this.enabled) return;
+
     const k = this.key(guildId, userId);
     if (this.activeSessions.has(k)) return;
 
@@ -153,6 +173,8 @@ class CallRankingManager {
   }
 
   async stopSession(guildId, userId) {
+    if (!this.enabled) return;
+
     const k = this.key(guildId, userId);
     const startedAt = this.activeSessions.get(k);
     if (!startedAt) return;
@@ -161,7 +183,6 @@ class CallRankingManager {
 
     const elapsed = Math.max(0, Date.now() - startedAt);
 
-    // pega username guardado (se existir)
     const existing = await this.query(
       `SELECT username FROM call_users WHERE guild_id = $1 AND user_id = $2`,
       [String(guildId), String(userId)]
@@ -173,8 +194,9 @@ class CallRankingManager {
       INSERT INTO call_users (guild_id, user_id, username, total_ms)
       VALUES ($1, $2, $3, $4)
       ON CONFLICT (guild_id, user_id)
-      DO UPDATE SET total_ms = call_users.total_ms + EXCLUDED.total_ms,
-                    username = EXCLUDED.username
+      DO UPDATE SET
+        total_ms = call_users.total_ms + EXCLUDED.total_ms,
+        username = EXCLUDED.username
       `,
       [String(guildId), String(userId), username, elapsed]
     );
@@ -183,13 +205,21 @@ class CallRankingManager {
   }
 
   async restoreActiveSessionsFromDb() {
+    if (!this.enabled) return;
+
     const res = await this.query(`SELECT session_key, started_at FROM call_sessions`);
     for (const row of res.rows) {
       this.activeSessions.set(String(row.session_key), Number(row.started_at));
     }
   }
 
+  // =========================
+  // Events
+  // =========================
   async handleVoiceStateUpdate(oldState, newState) {
+    // ✅ se DB caiu, não faz nada (evita spam)
+    if (!this.enabled) return;
+
     const member = newState.member || oldState.member;
     if (!member || !this.isTrackableUser(member.user)) return;
 
@@ -197,17 +227,26 @@ class CallRankingManager {
     const userId = member.id;
     if (!guildId || !userId) return;
 
+    // ✅ ranking só na Yakuza: ignora outros servidores
+    if (String(guildId) !== String(this.targetGuildId)) return;
+
     const wasIn = !!oldState.channelId;
     const isIn = !!newState.channelId;
 
-    await this.touchUser(guildId, member.user);
+    try {
+      await this.touchUser(guildId, member.user);
 
-    if (!wasIn && isIn) return this.startSession(guildId, userId);
-    if (wasIn && !isIn) return this.stopSession(guildId, userId);
+      if (!wasIn && isIn) await this.startSession(guildId, userId);
+      if (wasIn && !isIn) await this.stopSession(guildId, userId);
+    } catch (err) {
+      // se der erro aqui, desabilita para parar avalanche
+      console.error("❌ [CallRanking] erro em voiceStateUpdate, desabilitando:", err?.message || err);
+      this.enabled = false;
+    }
   }
 
   // =========================
-  // EMBED (SOMENTE YAKUZA)
+  // Embed / message update
   // =========================
   async buildEmbedForGuild(guild) {
     const res = await this.query(
@@ -262,10 +301,8 @@ class CallRankingManager {
       .setTimestamp();
   }
 
-  // =========================
-  // UPDATE FIXO: SEMPRE EDITA A MESMA MENSAGEM
-  // =========================
   async updateRankingMessage() {
+    if (!this.enabled) return;
     if (!this.targetGuildId || !this.targetChannelId || !this.targetMessageId) return;
 
     const guild = await this.client.guilds.fetch(String(this.targetGuildId)).catch(() => null);
@@ -277,26 +314,22 @@ class CallRankingManager {
     const msg = await channel.messages.fetch(String(this.targetMessageId)).catch(() => null);
     if (!msg) {
       console.error(
-        `[CallRanking] Não consegui buscar a mensagem fixa ${this.targetMessageId} no canal ${this.targetChannelId}. ` +
-        `Verifique: ID correto e permissão "Read Message History".`
+        `[CallRanking] Não consegui buscar a msg fixa ${this.targetMessageId} no canal ${this.targetChannelId}. ` +
+          `Confere permissão "Read Message History".`
       );
-      return;
+      return; // ❌ não cria nova msg
     }
 
     const embed = await this.buildEmbedForGuild(guild);
-
-    await msg.edit({ embeds: [embed] }).catch((err) => {
-      console.error("[CallRanking] Erro ao editar mensagem fixa:", err);
-    });
+    await msg.edit({ embeds: [embed] });
   }
 
   // =========================
-  // SNAPSHOT (opcional)
+  // Snapshot (opcional)
   // =========================
   async exportCurrentDataAsJsonObject() {
     const res = await this.query(`SELECT guild_id, user_id, username, total_ms FROM call_users`);
     const usersByGuild = {};
-
     for (const row of res.rows) {
       const gid = String(row.guild_id);
       if (!usersByGuild[gid]) usersByGuild[gid] = {};
@@ -305,7 +338,6 @@ class CallRankingManager {
         totalMs: Number(row.total_ms || 0),
       };
     }
-
     return {
       usersByGuild,
       rankingTarget: {
@@ -318,46 +350,81 @@ class CallRankingManager {
 
   async createSnapshotBackup() {
     try {
-      // Em Railway isso pode não persistir; Neon já é persistência.
+      if (!this.enabled) return;
       this.ensureStorage();
 
       const now = new Date();
       const pad = (n) => String(n).padStart(2, "0");
-      const filename = `call_ranking.snapshot.${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
+      const filename = `call_ranking.snapshot.${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(
+        now.getDate()
+      )}_${pad(now.getHours())}-${pad(now.getMinutes())}.json`;
       const snapshotPath = path.join(this.dataDir, filename);
 
       const json = await this.exportCurrentDataAsJsonObject();
       fs.writeFileSync(snapshotPath, JSON.stringify(json, null, 2));
 
-      this.lastSnapshotAt = Date.now();
       console.log(`[CallRanking] Snapshot criado: ${filename}`);
-
-      this.cleanupOldSnapshots(10);
     } catch (err) {
-      console.error("[CallRanking] Erro ao criar snapshot backup:", err);
+      console.warn("[CallRanking] Snapshot falhou:", err?.message || err);
     }
   }
 
-  cleanupOldSnapshots(keep = 10) {
+  // =========================
+  // Import do seu “backup base” (OPCIONAL)
+  // =========================
+  // Formato esperado do arquivo:
+  // {
+  //   "usersByGuild": {
+  //     "1476212383109087304": {
+  //       "123": { "username": "Fulano", "totalMs": 123456 }
+  //     }
+  //   }
+  // }
+  async importBaseSnapshotIfProvided() {
+    if (!this.enabled) return;
+
+    const filePath = process.env.CALL_RANKING_IMPORT_JSON || null;
+    if (!filePath) return;
+
     try {
-      if (!fs.existsSync(this.dataDir)) return;
-
-      const files = fs
-        .readdirSync(this.dataDir)
-        .filter((name) => name.startsWith("call_ranking.snapshot.") && name.endsWith(".json"))
-        .map((name) => ({
-          name,
-          fullPath: path.join(this.dataDir, name),
-          mtime: fs.statSync(path.join(this.dataDir, name)).mtimeMs,
-        }))
-        .sort((a, b) => b.mtime - a.mtime);
-
-      for (const file of files.slice(keep)) {
-        fs.unlinkSync(file.fullPath);
-        console.log(`[CallRanking] Snapshot antigo removido: ${file.name}`);
+      if (!fs.existsSync(filePath)) {
+        console.warn(`[CallRanking] IMPORT_JSON definido mas arquivo não existe: ${filePath}`);
+        return;
       }
+
+      const raw = fs.readFileSync(filePath, "utf8");
+      const json = JSON.parse(raw);
+
+      const gid = String(this.targetGuildId);
+      const map = json?.usersByGuild?.[gid];
+      if (!map || typeof map !== "object") {
+        console.warn("[CallRanking] Import JSON não tem usersByGuild para a guild alvo.");
+        return;
+      }
+
+      // upsert “base” (se já tiver mais horas no banco, não diminui)
+      // regra: total_ms = GREATEST(total_ms, incoming_total)
+      const entries = Object.entries(map);
+      for (const [userId, data] of entries) {
+        const username = data?.username || `ID ${userId}`;
+        const totalMs = Number(data?.totalMs || 0);
+
+        await this.query(
+          `
+          INSERT INTO call_users (guild_id, user_id, username, total_ms)
+          VALUES ($1, $2, $3, $4)
+          ON CONFLICT (guild_id, user_id)
+          DO UPDATE SET
+            username = EXCLUDED.username,
+            total_ms = GREATEST(call_users.total_ms, EXCLUDED.total_ms)
+          `,
+          [gid, String(userId), String(username), totalMs]
+        );
+      }
+
+      console.log(`✅ [CallRanking] Import base aplicado (${entries.length} usuários).`);
     } catch (err) {
-      console.warn("[CallRanking] Falha ao limpar snapshots antigos:", err?.message || err);
+      console.error("❌ [CallRanking] Falha ao importar base:", err?.message || err);
     }
   }
 
@@ -365,56 +432,78 @@ class CallRankingManager {
   // INIT
   // =========================
   async init() {
-    if (!this.databaseUrl) {
-      console.error("❌ [CallRanking] DATABASE_URL não definida. Configure no Railway Variables (Neon).");
-      return;
-    }
+    // evita crash geral caso falhe
+    try {
+      const ok = await this.connectDb().catch((e) => {
+        console.error("❌ [CallRanking] Falha ao conectar no Neon:", e?.message || e);
+        return false;
+      });
 
-    // Neon exige SSL; normalmente sslmode=require já vem na URL.
-    this.pool = new Pool({ connectionString: this.databaseUrl });
+      if (!ok) {
+        this.enabled = false;
+        console.warn("⚠️ [CallRanking] Desabilitado (sem DB).");
+        return;
+      }
 
-    // teste de conexão
-    await this.query("SELECT 1");
+      this.enabled = true;
 
-    await this.initDbSchema();
-    await this.restoreActiveSessionsFromDb();
+      await this.initDbSchema();
+      await this.restoreActiveSessionsFromDb();
 
-    // captura quem já está em call ao ligar
-    for (const guild of this.client.guilds.cache.values()) {
-      for (const voiceState of guild.voiceStates.cache.values()) {
-        if (!voiceState.channelId || !voiceState.member) continue;
-        if (!this.isTrackableUser(voiceState.member.user)) continue;
+      // ✅ aplica seu “backup base” se você passar o caminho (CALL_RANKING_IMPORT_JSON)
+      // Isso resolve seu ponto: “tenho dados base do último backup”
+      await this.importBaseSnapshotIfProvided();
 
-        await this.touchUser(guild.id, voiceState.member.user);
+      // captura quem já está em call ao ligar (somente yakuza)
+      const guild = this.client.guilds.cache.get(String(this.targetGuildId));
+      if (guild) {
+        for (const voiceState of guild.voiceStates.cache.values()) {
+          if (!voiceState.channelId || !voiceState.member) continue;
+          if (!this.isTrackableUser(voiceState.member.user)) continue;
 
-        const k = this.key(guild.id, voiceState.id);
-        if (!this.activeSessions.has(k)) {
-          await this.startSession(guild.id, voiceState.id);
+          await this.touchUser(guild.id, voiceState.member.user);
+
+          const k = this.key(guild.id, voiceState.id);
+          if (!this.activeSessions.has(k)) {
+            await this.startSession(guild.id, voiceState.id);
+          }
         }
       }
-    }
 
-    // update inicial (edita a msg fixa)
-    await this.updateRankingMessage().catch((err) => {
-      console.error("[CallRanking] Erro na atualização inicial:", err);
-    });
-
-    // snapshot inicial (opcional)
-    await this.createSnapshotBackup();
-
-    if (this.interval) clearInterval(this.interval);
-    this.interval = setInterval(() => {
-      this.updateRankingMessage().catch((err) => {
-        console.error("[CallRanking] Erro na atualização periódica:", err);
+      // update inicial (edita msg fixa)
+      await this.updateRankingMessage().catch((err) => {
+        console.error("[CallRanking] Erro na atualização inicial:", err?.message || err);
       });
-    }, this.updateIntervalMs);
 
-    if (this.snapshotInterval) clearInterval(this.snapshotInterval);
-    this.snapshotInterval = setInterval(() => {
-      this.createSnapshotBackup().catch?.(() => {});
-    }, this.snapshotBackupIntervalMs);
+      // timers
+      if (this.interval) clearInterval(this.interval);
+      this.interval = setInterval(() => {
+        this.updateRankingMessage().catch((err) => {
+          console.error("[CallRanking] Erro na atualização periódica:", err?.message || err);
+        });
+      }, this.updateIntervalMs);
 
-    console.log("✅ [CallRanking] Conectado no Neon/Postgres e rodando (ranking só na Yakuza).");
+      if (this.snapshotInterval) clearInterval(this.snapshotInterval);
+      this.snapshotInterval = setInterval(() => {
+        this.createSnapshotBackup().catch?.(() => {});
+      }, this.snapshotBackupIntervalMs);
+
+      console.log("✅ [CallRanking] Rodando: Neon OK, ranking só na Yakuza, editando msg fixa.");
+    } catch (err) {
+      this.enabled = false;
+      console.error("❌ [CallRanking] Init falhou e foi desabilitado:", err?.message || err);
+    }
+  }
+
+  // (opcional) encerrar pool
+  async close() {
+    try {
+      if (this.interval) clearInterval(this.interval);
+      if (this.snapshotInterval) clearInterval(this.snapshotInterval);
+      if (this.pool) await this.pool.end().catch(() => {});
+    } finally {
+      this.enabled = false;
+    }
   }
 }
 
