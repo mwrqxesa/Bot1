@@ -1,14 +1,19 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const { Pool } = require("pg");
 const { EmbedBuilder } = require("discord.js");
-const sqlite3 = require("sqlite3").verbose();
 
 class CallRankingManager {
   constructor(client) {
     this.client = client;
 
+    // ✅ Agora o banco é Neon/Postgres
+    this.databaseUrl = process.env.DATABASE_URL || null;
+    this.pool = null;
+
+    // (Opcional) snapshots em JSON local — útil se você roda no PC/VPS.
+    // Em Railway, arquivos podem não persistir; Neon já é a persistência real.
     this.dataDir = path.join(__dirname, "..", "data");
-    this.dbPath = path.join(this.dataDir, "call_ranking.sqlite");
 
     this.activeSessions = new Map(); // session_key(guild:user) => startedAt
     this.updateIntervalMs = 5 * 60 * 1000; // 5 min
@@ -18,16 +23,15 @@ class CallRankingManager {
     this.lastSnapshotAt = 0;
 
     this.interval = null;
-    this.db = null;
 
-    // ✅ Ranking SOMENTE na Yakuza (fixo)
+    // ✅ Ranking SOMENTE na Yakuza (fixo) e SEMPRE edita a mesma msg
     this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || null;
     this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null;
     this.targetMessageId = process.env.CALL_RANKING_MESSAGE_ID || null;
   }
 
   // =========================
-  // FS / DB
+  // FS (opcional: snapshots)
   // =========================
   ensureStorage() {
     if (!fs.existsSync(this.dataDir)) {
@@ -35,66 +39,36 @@ class CallRankingManager {
     }
   }
 
-  openDb() {
-    this.ensureStorage();
-    return new Promise((resolve, reject) => {
-      this.db = new sqlite3.Database(this.dbPath, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-  }
-
-  run(sql, params = []) {
-    return new Promise((resolve, reject) => {
-      this.db.run(sql, params, function (err) {
-        if (err) return reject(err);
-        resolve(this);
-      });
-    });
-  }
-
-  get(sql, params = []) {
-    return new Promise((resolve, reject) => {
-      this.db.get(sql, params, (err, row) => {
-        if (err) return reject(err);
-        resolve(row || null);
-      });
-    });
-  }
-
-  all(sql, params = []) {
-    return new Promise((resolve, reject) => {
-      this.db.all(sql, params, (err, rows) => {
-        if (err) return reject(err);
-        resolve(rows || []);
-      });
-    });
+  // =========================
+  // DB helpers (Postgres)
+  // =========================
+  async query(sql, params = []) {
+    return this.pool.query(sql, params);
   }
 
   async initDbSchema() {
     // ✅ totals por guild + user (NUNCA mistura servidores)
-    await this.run(`
+    await this.query(`
       CREATE TABLE IF NOT EXISTS call_users (
         guild_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
         username TEXT,
-        total_ms INTEGER NOT NULL DEFAULT 0,
+        total_ms BIGINT NOT NULL DEFAULT 0,
         PRIMARY KEY (guild_id, user_id)
       )
     `);
 
-    await this.run(`
+    await this.query(`
       CREATE TABLE IF NOT EXISTS call_sessions (
         session_key TEXT PRIMARY KEY,
         guild_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
-        started_at INTEGER NOT NULL
+        started_at BIGINT NOT NULL
       )
     `);
 
-    await this.run(`CREATE INDEX IF NOT EXISTS idx_call_users_guild ON call_users (guild_id)`);
-    await this.run(`CREATE INDEX IF NOT EXISTS idx_call_sessions_guild ON call_sessions (guild_id)`);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_call_users_guild ON call_users (guild_id)`);
+    await this.query(`CREATE INDEX IF NOT EXISTS idx_call_sessions_guild ON call_sessions (guild_id)`);
   }
 
   // =========================
@@ -123,8 +97,7 @@ class CallRankingManager {
     const totalMinutes = Math.floor((Number(ms) || 0) / 1000 / 60);
     const hours = Math.floor(totalMinutes / 60);
     const minutes = totalMinutes % 60;
-    if (hours > 0) return `${hours}h ${minutes}m`;
-    return `${minutes}m`;
+    return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
   }
 
   // =========================
@@ -133,10 +106,13 @@ class CallRankingManager {
   async touchUser(guildId, user) {
     if (!this.isTrackableUser(user)) return;
 
-    await this.run(
-      `INSERT INTO call_users (guild_id, user_id, username, total_ms)
-       VALUES (?, ?, ?, 0)
-       ON CONFLICT(guild_id, user_id) DO UPDATE SET username = excluded.username`,
+    await this.query(
+      `
+      INSERT INTO call_users (guild_id, user_id, username, total_ms)
+      VALUES ($1, $2, $3, 0)
+      ON CONFLICT (guild_id, user_id)
+      DO UPDATE SET username = EXCLUDED.username
+      `,
       [String(guildId), String(user.id), user.username]
     );
   }
@@ -165,10 +141,13 @@ class CallRankingManager {
     const now = Date.now();
     this.activeSessions.set(k, now);
 
-    await this.run(
-      `INSERT INTO call_sessions (session_key, guild_id, user_id, started_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(session_key) DO UPDATE SET started_at = excluded.started_at`,
+    await this.query(
+      `
+      INSERT INTO call_sessions (session_key, guild_id, user_id, started_at)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (session_key)
+      DO UPDATE SET started_at = EXCLUDED.started_at
+      `,
       [k, String(guildId), String(userId), now]
     );
   }
@@ -182,25 +161,30 @@ class CallRankingManager {
 
     const elapsed = Math.max(0, Date.now() - startedAt);
 
-    const existing = await this.get(
-      `SELECT username FROM call_users WHERE guild_id = ? AND user_id = ?`,
+    // pega username guardado (se existir)
+    const existing = await this.query(
+      `SELECT username FROM call_users WHERE guild_id = $1 AND user_id = $2`,
       [String(guildId), String(userId)]
     );
-    const username = existing?.username || `ID ${userId}`;
+    const username = existing.rows?.[0]?.username || `ID ${userId}`;
 
-    await this.run(
-      `INSERT INTO call_users (guild_id, user_id, username, total_ms)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(guild_id, user_id) DO UPDATE SET total_ms = total_ms + excluded.total_ms`,
+    await this.query(
+      `
+      INSERT INTO call_users (guild_id, user_id, username, total_ms)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (guild_id, user_id)
+      DO UPDATE SET total_ms = call_users.total_ms + EXCLUDED.total_ms,
+                    username = EXCLUDED.username
+      `,
       [String(guildId), String(userId), username, elapsed]
     );
 
-    await this.run(`DELETE FROM call_sessions WHERE session_key = ?`, [k]);
+    await this.query(`DELETE FROM call_sessions WHERE session_key = $1`, [k]);
   }
 
   async restoreActiveSessionsFromDb() {
-    const rows = await this.all(`SELECT session_key, started_at FROM call_sessions`);
-    for (const row of rows) {
+    const res = await this.query(`SELECT session_key, started_at FROM call_sessions`);
+    for (const row of res.rows) {
       this.activeSessions.set(String(row.session_key), Number(row.started_at));
     }
   }
@@ -218,29 +202,22 @@ class CallRankingManager {
 
     await this.touchUser(guildId, member.user);
 
-    if (!wasIn && isIn) {
-      await this.startSession(guildId, userId);
-      return;
-    }
-
-    if (wasIn && !isIn) {
-      await this.stopSession(guildId, userId);
-      return;
-    }
+    if (!wasIn && isIn) return this.startSession(guildId, userId);
+    if (wasIn && !isIn) return this.stopSession(guildId, userId);
   }
 
   // =========================
   // EMBED (SOMENTE YAKUZA)
   // =========================
   async buildEmbedForGuild(guild) {
-    const rows = await this.all(
-      `SELECT user_id, total_ms FROM call_users WHERE guild_id = ?`,
+    const res = await this.query(
+      `SELECT user_id, total_ms FROM call_users WHERE guild_id = $1`,
       [String(guild.id)]
     );
 
-    const ranking = rows
+    const ranking = res.rows
       .map((row) => ({
-        userId: row.user_id,
+        userId: String(row.user_id),
         totalMs: Number(row.total_ms || 0) + this.getLiveMs(guild.id, row.user_id),
       }))
       .sort((a, b) => b.totalMs - a.totalMs);
@@ -297,18 +274,16 @@ class CallRankingManager {
     const channel = await guild.channels.fetch(String(this.targetChannelId)).catch(() => null);
     if (!channel || !channel.isTextBased?.()) return;
 
-    const embed = await this.buildEmbedForGuild(guild);
-
-    // ✅ BUSCA a mensagem fixa e EDITA
     const msg = await channel.messages.fetch(String(this.targetMessageId)).catch(() => null);
-
     if (!msg) {
       console.error(
         `[CallRanking] Não consegui buscar a mensagem fixa ${this.targetMessageId} no canal ${this.targetChannelId}. ` +
         `Verifique: ID correto e permissão "Read Message History".`
       );
-      return; // ❌ não envia nova
+      return;
     }
+
+    const embed = await this.buildEmbedForGuild(guild);
 
     await msg.edit({ embeds: [embed] }).catch((err) => {
       console.error("[CallRanking] Erro ao editar mensagem fixa:", err);
@@ -319,10 +294,10 @@ class CallRankingManager {
   // SNAPSHOT (opcional)
   // =========================
   async exportCurrentDataAsJsonObject() {
-    const rows = await this.all(`SELECT guild_id, user_id, username, total_ms FROM call_users`);
+    const res = await this.query(`SELECT guild_id, user_id, username, total_ms FROM call_users`);
     const usersByGuild = {};
 
-    for (const row of rows) {
+    for (const row of res.rows) {
       const gid = String(row.guild_id);
       if (!usersByGuild[gid]) usersByGuild[gid] = {};
       usersByGuild[gid][row.user_id] = {
@@ -343,6 +318,7 @@ class CallRankingManager {
 
   async createSnapshotBackup() {
     try {
+      // Em Railway isso pode não persistir; Neon já é persistência.
       this.ensureStorage();
 
       const now = new Date();
@@ -364,6 +340,8 @@ class CallRankingManager {
 
   cleanupOldSnapshots(keep = 10) {
     try {
+      if (!fs.existsSync(this.dataDir)) return;
+
       const files = fs
         .readdirSync(this.dataDir)
         .filter((name) => name.startsWith("call_ranking.snapshot.") && name.endsWith(".json"))
@@ -387,9 +365,17 @@ class CallRankingManager {
   // INIT
   // =========================
   async init() {
-    this.ensureStorage();
+    if (!this.databaseUrl) {
+      console.error("❌ [CallRanking] DATABASE_URL não definida. Configure no Railway Variables (Neon).");
+      return;
+    }
 
-    await this.openDb();
+    // Neon exige SSL; normalmente sslmode=require já vem na URL.
+    this.pool = new Pool({ connectionString: this.databaseUrl });
+
+    // teste de conexão
+    await this.query("SELECT 1");
+
     await this.initDbSchema();
     await this.restoreActiveSessionsFromDb();
 
@@ -413,7 +399,7 @@ class CallRankingManager {
       console.error("[CallRanking] Erro na atualização inicial:", err);
     });
 
-    // snapshot inicial
+    // snapshot inicial (opcional)
     await this.createSnapshotBackup();
 
     if (this.interval) clearInterval(this.interval);
@@ -427,6 +413,8 @@ class CallRankingManager {
     this.snapshotInterval = setInterval(() => {
       this.createSnapshotBackup().catch?.(() => {});
     }, this.snapshotBackupIntervalMs);
+
+    console.log("✅ [CallRanking] Conectado no Neon/Postgres e rodando (ranking só na Yakuza).");
   }
 }
 
