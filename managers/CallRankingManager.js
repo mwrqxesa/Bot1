@@ -13,11 +13,11 @@ class CallRankingManager {
 
     // ====== RANKING FIXO (YAKUZA) ======
     this.targetGuildId = process.env.CALL_RANKING_GUILD_ID || "1476212383109087304";
-    this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null; // ✅ precisa ser o CANAL correto
+    this.targetChannelId = process.env.CALL_RANKING_CHANNEL_ID || null; // precisa ser o CANAL correto
     this.targetMessageId = process.env.CALL_RANKING_MESSAGE_ID || "1477465092470608015";
 
-    // ====== FILTROS (CAVE/BOT) ======
-    // Remover TOP7 da Cave + remover o bot da Yakuza do ranking
+    // ====== FILTROS ======
+    // remover TOP7 (da Cave que foi parar na base) + remover bot da yakuza do ranking
     this.excludedUserIds = new Set([
       "1098636834680094821", // TOP 7 (Cave)
       "1237058787093905510", // bot da Yakuza (não mostrar no ranking)
@@ -99,8 +99,7 @@ class CallRankingManager {
   // =========================
   isTrackableUser(user) {
     if (!user) return false;
-    // ❌ ignora bots (incluindo o seu bot)
-    if (user.bot) return false;
+    if (user.bot) return false; // ignora bots
     return true;
   }
 
@@ -131,8 +130,7 @@ class CallRankingManager {
 
     const u = String(unit || "hours").toLowerCase();
     if (u === "minutes" || u === "min" || u === "m") return Math.round(n * 60 * 1000);
-    // default: horas
-    return Math.round(n * 60 * 60 * 1000);
+    return Math.round(n * 60 * 60 * 1000); // hours default
   }
 
   // =========================
@@ -153,24 +151,23 @@ class CallRankingManager {
     );
   }
 
-  // ✅ Isso resolve o "0.00 horas" (pega banco + ao vivo)
-  async getUserTotalMs(guildId, userId) {
-    if (!this.enabled) return 0;
-
+  async getUserStoredMs(guildId, userId) {
     const res = await this.query(
       `SELECT total_ms FROM call_users WHERE guild_id = $1 AND user_id = $2`,
       [String(guildId), String(userId)]
     );
+    return Number(res.rows?.[0]?.total_ms || 0);
+  }
 
-    const stored = Number(res.rows?.[0]?.total_ms || 0);
+  async getUserTotalMs(guildId, userId) {
+    if (!this.enabled) return 0;
+    const stored = await this.getUserStoredMs(guildId, userId);
     const live = this.getLiveMs(guildId, userId);
     return stored + live;
   }
 
-  // ✅ soma tempo (horas/minutos) no banco
   async addTimeToUser(guildId, userId, username, amount, unit = "hours") {
     if (!this.enabled) throw new Error("CallRanking desativado (sem DB).");
-
     const ms = this.msFromAmount(amount, unit);
 
     await this.query(
@@ -188,7 +185,54 @@ class CallRankingManager {
     return ms;
   }
 
-  // ✅ transfere tempo (tira de 1 e coloca no outro)
+  /**
+   * ✅ FLUSH DO TEMPO AO VIVO:
+   * materializa (liveMs) no banco e reseta started_at = now
+   * Assim o live zera e não “engana” transferência/consulta.
+   */
+  async flushLiveSessionToDb(guildId, userId) {
+    if (!this.enabled) return 0;
+
+    const k = this.key(guildId, userId);
+    const startedAt = this.activeSessions.get(k);
+    if (!startedAt) return 0;
+
+    const now = Date.now();
+    const liveMs = Math.max(0, now - startedAt);
+
+    if (liveMs > 0) {
+      await this.query(
+        `
+        INSERT INTO call_users (guild_id, user_id, username, total_ms)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (guild_id, user_id)
+        DO UPDATE SET total_ms = call_users.total_ms + EXCLUDED.total_ms
+        `,
+        [String(guildId), String(userId), `ID ${userId}`, liveMs]
+      );
+    }
+
+    // reseta sessão
+    await this.query(
+      `
+      INSERT INTO call_sessions (session_key, guild_id, user_id, started_at)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (session_key)
+      DO UPDATE SET started_at = EXCLUDED.started_at
+      `,
+      [k, String(guildId), String(userId), now]
+    );
+
+    this.activeSessions.set(k, now);
+    return liveMs;
+  }
+
+  /**
+   * ✅ TRANSFERÊNCIA CORRIGIDA:
+   * - flush no FROM e TO (se estiverem em call)
+   * - faz o desconto/adição no banco
+   * => tira inclusive aquelas “1:27” ao vivo.
+   */
   async transferTime(guildId, fromUser, toUser, amount, unit = "hours") {
     if (!this.enabled) throw new Error("CallRanking desativado (sem DB).");
     if (!fromUser || !toUser) throw new Error("Usuários inválidos.");
@@ -196,37 +240,32 @@ class CallRankingManager {
 
     const ms = this.msFromAmount(amount, unit);
 
-    // saldo atual de quem vai transferir
-    const fromTotal = await this.getUserTotalMs(guildId, fromUser.id);
-    if (fromTotal < ms) {
-      throw new Error(
-        `Saldo insuficiente: ${fromUser} tem ${this.formatMs(fromTotal)} e tentou transferir ${this.formatMs(ms)}.`
-      );
-    }
-
-    // Para não “bagunçar” sessão ao vivo:
-    // desconta do stored (banco) apenas, mas garantindo que stored >= 0
-    // (se quiser, eu posso “congelar” a sessão antes, mas aqui fica estável)
     await this.query("BEGIN");
-
     try {
-      // garante registros
       await this.touchUser(guildId, fromUser);
       await this.touchUser(guildId, toUser);
 
-      // desconta do FROM
-      // (não deixa negativo)
+      // ✅ IMPORTANTÍSSIMO:
+      await this.flushLiveSessionToDb(guildId, fromUser.id);
+      await this.flushLiveSessionToDb(guildId, toUser.id);
+
+      const fromStored = await this.getUserStoredMs(guildId, fromUser.id);
+      if (fromStored < ms) {
+        throw new Error(
+          `Saldo insuficiente: ${fromUser} tem ${this.formatMs(fromStored)} e tentou transferir ${this.formatMs(ms)}.`
+        );
+      }
+
       await this.query(
         `
         UPDATE call_users
-        SET total_ms = GREATEST(0, total_ms - $3),
+        SET total_ms = total_ms - $3,
             username = $4
         WHERE guild_id = $1 AND user_id = $2
         `,
         [String(guildId), String(fromUser.id), ms, String(fromUser.username)]
       );
 
-      // soma no TO
       await this.query(
         `
         UPDATE call_users
@@ -238,12 +277,11 @@ class CallRankingManager {
       );
 
       await this.query("COMMIT");
+      return ms;
     } catch (e) {
       await this.query("ROLLBACK");
       throw e;
     }
-
-    return ms;
   }
 
   // =========================
@@ -323,7 +361,7 @@ class CallRankingManager {
     const userId = member.id;
     if (!guildId || !userId) return;
 
-    // ✅ ranking só na Yakuza (do jeito que você pediu)
+    // ranking só na Yakuza
     if (String(guildId) !== String(this.targetGuildId)) return;
 
     const wasIn = !!oldState.channelId;
@@ -354,7 +392,6 @@ class CallRankingManager {
         userId: String(row.user_id),
         totalMs: Number(row.total_ms || 0) + this.getLiveMs(guild.id, row.user_id),
       }))
-      // ✅ remove ids “da cave”/bot
       .filter((u) => !this.excludedUserIds.has(u.userId))
       .sort((a, b) => b.totalMs - a.totalMs);
 
@@ -411,8 +448,7 @@ class CallRankingManager {
     const msg = await channel.messages.fetch(String(this.targetMessageId)).catch(() => null);
     if (!msg) {
       console.error(
-        `[CallRanking] Não consegui buscar a msg fixa ${this.targetMessageId} no canal ${this.targetChannelId}. ` +
-          `Confere "Read Message History".`
+        `[CallRanking] Não consegui buscar a msg fixa ${this.targetMessageId} no canal ${this.targetChannelId}. Confere "Read Message History".`
       );
       return;
     }
@@ -482,7 +518,6 @@ class CallRankingManager {
       }
 
       if (!this.targetChannelId) {
-        // ✅ evita aquele erro silencioso (canal errado)
         console.error("❌ [CallRanking] CALL_RANKING_CHANNEL_ID não definido (canal da mensagem do ranking).");
         this.enabled = false;
         return;
@@ -500,7 +535,7 @@ class CallRankingManager {
           if (!voiceState.channelId || !voiceState.member) continue;
           if (!this.isTrackableUser(voiceState.member.user)) continue;
 
-          const userId = voiceState.member.id; // ✅ CORRETO (não é voiceState.id)
+          const userId = voiceState.member.id;
           await this.touchUser(guild.id, voiceState.member.user);
 
           const k = this.key(guild.id, userId);
