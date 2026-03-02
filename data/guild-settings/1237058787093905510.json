@@ -1,0 +1,8 @@
+{
+  "friendlyName": "Yakuza",
+  "autoVoice": {
+    "enabled": true,
+    "channelId": "1476401616784724030",
+    "label": "call_247"
+  }
+}
