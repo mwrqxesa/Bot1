@@ -5,56 +5,55 @@ require('dotenv').config();
 
 const commands = [];
 const commandsPath = path.join(__dirname, 'commands');
-const commandFiles = fs.readdirSync(commandsPath).filter(file => 
-    file.endsWith('.js') && file !== 'index.js'
-);
+
+const commandFiles = fs
+  .readdirSync(commandsPath)
+  .filter(file => file.endsWith('.js') && file !== 'index.js');
 
 for (const file of commandFiles) {
-    try {
-        const filePath = path.join(commandsPath, file);
-        const command = require(filePath);
-        
-        if ('data' in command && 'execute' in command) {
-            // Removido o .toJSON()
-            commands.push(command.data);
-            console.log(`[INFO] Carregado comando: ${command.data.name}`);
-        } else {
-            console.log(`[AVISO] O comando em ${filePath} está faltando 'data' ou 'execute' requerida.`);
-        }
-    } catch (error) {
-        console.error(`[ERRO] Erro ao carregar comando ${file}:`, error);
-    }
+  const filePath = path.join(commandsPath, file);
+  const command = require(filePath);
+
+  if ('data' in command && 'execute' in command) {
+    commands.push(command.data.toJSON()); // ✅ necessário
+    console.log(`[INFO] Carregado comando: ${command.data.name}`);
+  } else {
+    console.log(`[AVISO] ${file} está faltando 'data' ou 'execute'.`);
+  }
 }
 
-// Verificar token e client ID antes de prosseguir
-if (!process.env.BOT_TOKEN || process.env.BOT_TOKEN === 'seu_token_do_bot_aqui') {
-    console.error('[ERRO] Token do bot inválido no arquivo .env');
-    process.exit(1);
+if (!process.env.BOT_TOKEN) {
+  console.error('[ERRO] BOT_TOKEN não definido no .env');
+  process.exit(1);
 }
-
-if (!process.env.CLIENT_ID || process.env.CLIENT_ID === 'id_do_seu_bot_aqui') {
-    console.error('[ERRO] Client ID inválido no arquivo .env');
-    process.exit(1);
+if (!process.env.CLIENT_ID) {
+  console.error('[ERRO] CLIENT_ID não definido no .env');
+  process.exit(1);
 }
 
 const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
 
 (async () => {
-    try {
-        console.log(`Começando a atualizar ${commands.length} comandos (/) da aplicação.`);
-        console.log('Usando Client ID:', process.env.CLIENT_ID);
+  try {
+    console.log(`Deploy de ${commands.length} comando(s)...`);
 
-        const data = await rest.put(
-            Routes.applicationCommands(process.env.CLIENT_ID),
-            { body: commands }
-        );
-
-        console.log(`Sucesso! ${data.length} comandos (/) foram atualizados.`);
-    } catch (error) {
-        if (error.code === 0) {
-            console.error('[ERRO] Falha na autenticação. Verifique se o token do bot está correto no arquivo .env');
-        } else {
-            console.error('Erro ao atualizar comandos:', error);
-        }
+    // ✅ GUILD (aparece na hora) - recomendado
+    if (process.env.GUILD_ID) {
+      const data = await rest.put(
+        Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+        { body: commands }
+      );
+      console.log(`✅ Sucesso! ${data.length} comando(s) registrados na guild.`);
+      return;
     }
+
+    // 🌍 GLOBAL (pode demorar pra aparecer)
+    const data = await rest.put(
+      Routes.applicationCommands(process.env.CLIENT_ID),
+      { body: commands }
+    );
+    console.log(`✅ Sucesso! ${data.length} comando(s) globais atualizados.`);
+  } catch (error) {
+    console.error('❌ Erro no deploy:', error);
+  }
 })();
