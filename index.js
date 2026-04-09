@@ -30,6 +30,7 @@ const ClanManager = require("./handlers/ClanManager");
 const PlayerManager = require("./utils/PlayerManager");
 const GuildSettingsManager = require("./managers/GuildSettingsManager");
 const CallRankingManager = require("./managers/CallRankingManager");
+const MinecraftBridgeManager = require("./managers/MinecraftBridgeManager");
 
 // =====================
 // CONFIG
@@ -151,6 +152,7 @@ client.players = new PlayerManager();
 client.guildSettingsManager = new GuildSettingsManager(client);
 client.recruitmentManager = new RecruitmentManager(client);
 client.callRanking = new CallRankingManager(client);
+client.minecraftBridge = new MinecraftBridgeManager(client);
 
 // =====================
 // HELPERS 24/7 VOICE
@@ -385,6 +387,8 @@ client.once(Events.ClientReady, async () => {
     await client.callRanking.init();
     console.log("✅ Ranking de call inicializado");
 
+    await client.minecraftBridge.init();
+
     // entra nas 2 calls 24/7
     await ensureAll247Voices();
 
@@ -484,6 +488,18 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (error) {
     console.error("Error handling interaction:", error);
+  }
+});
+
+
+// =====================
+// MENSAGENS (ponte Discord <-> Minecraft clan chat)
+// =====================
+client.on("messageCreate", async (message) => {
+  try {
+    await client.minecraftBridge?.handleDiscordMessage(message);
+  } catch (error) {
+    console.error("Erro no encaminhamento Discord->Minecraft:", error);
   }
 });
 
